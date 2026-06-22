@@ -1,0 +1,12 @@
+# CRE Underwriter — Python dependencies
+#
+# The underwriting engine (Phase 1-2) and SQLite storage (Phase 3) use only the
+# Python standard library. The dashboard (Phase 4) adds Streamlit; the RentCast
+# integration (Phase 5) adds requests.
+#
+# Install with:  pip install -r requirements.txt
+
+streamlit>=1.30          # Phase 4: dashboard UI
+requests>=2.31           # Phase 5: RentCast API client (address lookup)
+
+# Project rule: ask before adding any new dependency.

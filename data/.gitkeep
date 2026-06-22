@@ -1,0 +1,2 @@
+# Keeps the data/ directory under version control.
+# The SQLite database file (added in Phase 3) lives here and is git-ignored.
