@@ -21,11 +21,12 @@ import streamlit as st
 # `streamlit run cre_underwriter/dashboard.py` (script folder on the path) and as
 # part of the package.
 try:
-    from cre_underwriter import engine, database, rentcast
+    from cre_underwriter import engine, database, rentcast, extraction
 except ModuleNotFoundError:
     import engine
     import database
     import rentcast
+    import extraction
 
 
 # st.set_page_config must be the first Streamlit call.
@@ -42,6 +43,11 @@ def _money(amount):
     """Format a dollar amount like $69,600 or -$3,480."""
     sign = "-" if amount < 0 else ""
     return f"{sign}${abs(amount):,.0f}"
+
+
+def _money_or_dash(value):
+    """Format a dollar amount, or an em dash when it's None (for review tables)."""
+    return "—" if value is None else _money(value)
 
 
 def _format_metric(value, display):
@@ -417,6 +423,142 @@ def render_rentcast_panel():
 
 
 # -----------------------------------------------------------------------------
+# Import from documents (AI) — Phase D
+#
+# Upload a rent roll and/or operating statement (T-12); Claude reads them into the
+# existing rent-roll and expense inputs for the user to REVIEW and edit. The API is
+# called ONLY on the "Extract" button press (never on an ordinary rerun). Extraction
+# only POPULATES the editable form — the deterministic engine still does every metric
+# and the buy/pass decision, and only when the user clicks Run underwriting.
+#
+# The actual form pre-fill happens in the apply-before-widgets step below (via the
+# _pending_extract flag), exactly like a saved-deal load — you can't change a widget's
+# value after it's been created.
+# -----------------------------------------------------------------------------
+EXPENSE_LINE_LABELS = {
+    "taxes": "Property taxes",
+    "insurance": "Insurance",
+    "management": "Management",
+    "repairs": "Repairs & maintenance",
+    "utilities": "Utilities (owner-paid)",
+    "reserves": "Replacement reserves",
+    "hoa": "HOA fees",
+}
+
+
+def _extraction_has_data(result):
+    """True if an extraction result carries a rent roll or any expense figure."""
+    if not result or not result.get("ok"):
+        return False
+    has_rent_roll = bool(result.get("rent_roll"))
+    has_expense = any(v is not None for v in (result.get("operating_expenses") or {}).values())
+    return has_rent_roll or has_expense
+
+
+def _render_extraction_review():
+    """Show what the most recent extraction pulled, so the user can eyeball it before
+    editing the pre-filled fields. Reads the stored result; makes no API call."""
+    result = st.session_state.get("_extraction_result")
+    if result is None:
+        return
+
+    if not result.get("ok"):
+        # The missing-key case is already warned about by the uploader section above.
+        if result.get("error_type") != "missing_key":
+            st.warning(result.get("error", "Extraction failed."))
+        return
+
+    rent_roll = result.get("rent_roll") or []
+    expenses = result.get("operating_expenses") or {}
+    any_expense = any(v is not None for v in expenses.values())
+
+    if not rent_roll and not any_expense:
+        st.warning("Claude didn't find a rent roll or expense figures in the document(s). "
+                   "Your manual inputs are unchanged — enter the numbers yourself.")
+        for note in result.get("notes") or []:
+            st.caption(f"• {note}")
+        return
+
+    st.success(f"Extracted with `{result.get('model')}` — these are AI estimates. Review "
+               "them here, then check and edit the pre-filled fields below before underwriting.")
+
+    if rent_roll:
+        st.markdown(f"**Rent roll** — {len(rent_roll)} unit(s) pulled")
+        preview = [{
+            "Unit": unit.get("label"),
+            "Type": unit.get("unit_type") or "—",
+            "SqFt": "—" if unit.get("square_footage") is None else f"{unit['square_footage']:,.0f}",
+            "Rent/mo": _money_or_dash(unit.get("monthly_rent")),
+            "Market/mo": _money_or_dash(unit.get("market_rent")),
+            "Occupied": "Yes" if unit.get("occupied", True) else "No",
+        } for unit in rent_roll]
+        st.dataframe(preview, hide_index=True, use_container_width=True)
+
+    if any_expense:
+        st.markdown("**Operating expenses** (annual, as found)")
+        rows = [[EXPENSE_LINE_LABELS[key], _money_or_dash(expenses.get(key))]
+                for key in extraction.EXPENSE_KEYS]
+        total = sum(v for v in expenses.values() if v is not None)
+        rows.append(["**Total loaded**", f"**{_money(total)}**"])
+        st.markdown(_markdown_table(["Line item", "Annual amount"], rows))
+        st.caption("Loaded as a single operating-expense **total** (the sum above) in Simple "
+                   "mode — a statement reports actual dollars. Switch to detailed line items "
+                   "below if you'd rather model taxes/management/repairs as percentages.")
+
+    for note in result.get("notes") or []:
+        st.caption(f"• {note}")
+
+    st.caption("⚠️ AI-extracted estimates — double-check every value before you run the numbers.")
+
+
+def _render_document_import():
+    """The 'Import from documents (AI)' section: a file uploader plus an Extract button
+    that makes ONE API call on press, then a review panel. Pre-fills happen via the
+    _pending_extract flag (applied before the input widgets are created)."""
+    with st.expander("📄 Import from documents (AI)", expanded=False):
+        st.caption(
+            "Upload a rent roll and/or operating statement (T-12) — PDF, image, CSV, or "
+            "Excel — and Claude reads it into the rent-roll and expense inputs below. "
+            "**These are AI-extracted estimates to review, not final.** You can edit every "
+            "value; the buy/pass math is still the deterministic engine, run only when you "
+            "click **Run underwriting**."
+        )
+        if not extraction.has_api_key():
+            st.warning(extraction.MISSING_KEY_MESSAGE)
+
+        st.file_uploader(
+            "Document(s)",
+            type=["pdf", "png", "jpg", "jpeg", "gif", "webp", "csv", "xlsx", "xls", "txt"],
+            accept_multiple_files=True,
+            key="_doc_uploads",
+            help="Upload the rent roll, the operating statement, or both.",
+        )
+        st.caption("One **Extract** = one Claude API call. The cost is tiny — a fraction of "
+                   "a cent — but it does call the API, so it only runs on the button press.")
+
+        if st.button("Extract", key="extract_btn", use_container_width=True):
+            uploaded = st.session_state.get("_doc_uploads") or []
+            if not uploaded:
+                st.warning("Upload at least one document before extracting.")
+            else:
+                files = [(item.name, item.getvalue()) for item in uploaded]
+                with st.spinner("Reading your document(s) with Claude…"):
+                    result = extraction.extract_from_documents(files)
+                st.session_state["_extraction_result"] = result
+                # Only pre-fill the form when something usable came back; otherwise the
+                # manual inputs are left exactly as they were.
+                if _extraction_has_data(result):
+                    st.session_state["_pending_extract"] = result
+                    st.session_state["_flash"] = (
+                        "Pre-filled the form from your document(s). Review and edit the "
+                        "values below, then click Run underwriting."
+                    )
+                st.rerun()
+
+        _render_extraction_review()
+
+
+# -----------------------------------------------------------------------------
 # Form state: seed defaults from the engine's sample deal, and load saved deals.
 #
 # Streamlit reruns this whole script on every interaction. We keep each input in
@@ -589,6 +731,42 @@ def _apply_deal_to_form(deal):
     st.session_state["sell_cost_pct"] = float(deal.get("selling_cost_pct", defaults["selling_cost_pct"])) * 100.0
 
 
+def _apply_extraction_to_form(result):
+    """Pre-fill the rent-roll and expense inputs from an AI extraction result.
+
+    Only POPULATES the editable form fields (same session-state writes _apply_deal_to_form
+    makes, so it must run before the input widgets are created). The user then reviews and
+    edits every value; the engine still does all the underwriting.
+
+    Income: a pulled rent roll switches Income to detailed mode and fills the table.
+    Expenses: the found line items load as a single operating-expense TOTAL in Simple mode —
+    a T-12 reports actual annual dollars, and detailed mode would force taxes/management/
+    repairs back onto %-of-price / %-of-income bases the statement doesn't give us.
+    """
+    rent_roll = result.get("rent_roll") or []
+    if rent_roll:
+        st.session_state["rent_roll"] = [
+            {
+                "label": str(unit.get("label") or f"Unit {index + 1}"),
+                "unit_type": str(unit.get("unit_type") or ""),
+                "square_footage": unit.get("square_footage"),
+                "monthly_rent": float(unit.get("monthly_rent") or 0.0),
+                "market_rent": unit.get("market_rent"),
+                "occupied": bool(unit.get("occupied", True)),
+            }
+            for index, unit in enumerate(rent_roll)
+        ]
+        st.session_state.pop("rent_roll_editor", None)   # drop the editor's stale edits
+        st.session_state["income_mode_label"] = "Detailed (rent roll)"
+        st.session_state["number_of_units"] = max(len(rent_roll), 1)
+
+    expenses = result.get("operating_expenses") or {}
+    found = {key: value for key, value in expenses.items() if value is not None}
+    if found:
+        st.session_state["operating_expenses"] = float(sum(found.values()))
+        st.session_state["expense_mode_label"] = "Simple (single total)"
+
+
 # Seed defaults first (only fills keys that don't exist yet).
 _seed_form_defaults()
 
@@ -613,6 +791,13 @@ if _pending_prefill is not None:
     for field, value in _pending_prefill["fields"].items():
         st.session_state[field] = value
     st.session_state["_flash"] = _pending_prefill["message"]
+
+# Apply a pending document extraction (set by the "Extract" button) BEFORE the input
+# widgets are created — same rule as the load and RentCast pre-fill above. The flash
+# message is set by the button handler; here we only populate the fields.
+_pending_extract = st.session_state.pop("_pending_extract", None)
+if _pending_extract is not None:
+    _apply_extraction_to_form(_pending_extract)
 
 
 # -----------------------------------------------------------------------------
@@ -692,6 +877,9 @@ render_rentcast_panel()
 # -----------------------------------------------------------------------------
 st.subheader("Deal inputs")
 st.text_input("Deal name", key="name")
+
+# Import from documents (AI) — pre-fills the rent roll and expenses below for review.
+_render_document_import()
 
 # Property type sets the expense template (Phase 12). Changing it loads that type's
 # expense defaults; it changes nothing else in the underwriting math.

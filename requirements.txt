@@ -2,11 +2,19 @@
 #
 # The underwriting engine (Phase 1-2) and SQLite storage (Phase 3) use only the
 # Python standard library. The dashboard (Phase 4) adds Streamlit; the RentCast
-# integration (Phase 5) adds requests.
+# integration (Phase 5) adds requests. AI document extraction (Phase D) reuses
+# requests to call the Anthropic API — no new dependency.
 #
 # Install with:  pip install -r requirements.txt
 
 streamlit>=1.30          # Phase 4: dashboard UI
-requests>=2.31           # Phase 5: RentCast API client (address lookup)
+requests>=2.31           # Phase 5: RentCast client + Phase D: Anthropic API client
 
+# Phase D needs an Anthropic API key in the ANTHROPIC_API_KEY environment variable
+# (https://console.anthropic.com). Without it, manual entry still works; AI import
+# just shows a friendly "set the key" notice.
+#
+# Optional: reading EXCEL uploads (.xlsx/.xls) needs openpyxl (pip install openpyxl).
+# Without it, PDF / image / CSV imports still work; Excel shows a "export to CSV" note.
+#
 # Project rule: ask before adding any new dependency.
