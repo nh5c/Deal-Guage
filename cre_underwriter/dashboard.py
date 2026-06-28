@@ -447,12 +447,17 @@ EXPENSE_LINE_LABELS = {
 
 
 def _extraction_has_data(result):
-    """True if an extraction result carries a rent roll or any expense figure."""
+    """True if an extraction result carries anything that PRE-FILLS a form field —
+    a rent roll, an expense, the offering price, or a stated vacancy rate. (The stated
+    NOIs are display-only cross-checks, so they don't count toward pre-filling.)"""
     if not result or not result.get("ok"):
         return False
+    summary = result.get("summary") or {}
     has_rent_roll = bool(result.get("rent_roll"))
     has_expense = any(v is not None for v in (result.get("operating_expenses") or {}).values())
-    return has_rent_roll or has_expense
+    has_price = summary.get("offering_price") is not None
+    has_vacancy = summary.get("vacancy_rate_pct") is not None
+    return has_rent_roll or has_expense or has_price or has_vacancy
 
 
 def _render_extraction_review():
@@ -468,19 +473,31 @@ def _render_extraction_review():
             st.warning(result.get("error", "Extraction failed."))
         return
 
+    summary = result.get("summary") or {}
     rent_roll = result.get("rent_roll") or []
     expenses = result.get("operating_expenses") or {}
     any_expense = any(v is not None for v in expenses.values())
+    any_summary = any(summary.get(key) is not None for key in extraction.SUMMARY_KEYS)
 
-    if not rent_roll and not any_expense:
-        st.warning("Claude didn't find a rent roll or expense figures in the document(s). "
-                   "Your manual inputs are unchanged — enter the numbers yourself.")
+    if not rent_roll and not any_expense and not any_summary:
+        st.warning("Claude didn't find a price, rent roll, or expense figures in the "
+                   "document(s). Your manual inputs are unchanged — enter the numbers yourself.")
         for note in result.get("notes") or []:
             st.caption(f"• {note}")
         return
 
     st.success(f"Extracted with `{result.get('model')}` — these are AI estimates. Review "
                "them here, then check and edit the pre-filled fields below before underwriting.")
+
+    # Property summary: the offering price + vacancy that pre-fill the inputs.
+    summary_rows = []
+    if summary.get("offering_price") is not None:
+        summary_rows.append(["Offering / asking price → purchase price", _money(summary["offering_price"])])
+    if summary.get("vacancy_rate_pct") is not None:
+        summary_rows.append(["Vacancy rate → vacancy input", f"{summary['vacancy_rate_pct']:.1f}%"])
+    if summary_rows:
+        st.markdown("**Property summary** (pre-filled)")
+        st.markdown(_markdown_table(["Field", "Value"], summary_rows))
 
     if rent_roll:
         st.markdown(f"**Rent roll** — {len(rent_roll)} unit(s) pulled")
@@ -505,8 +522,42 @@ def _render_extraction_review():
                    "mode — a statement reports actual dollars. Switch to detailed line items "
                    "below if you'd rather model taxes/management/repairs as percentages.")
 
+    # Stated NOI: a cross-check the user reads against the tool's own computed NOI —
+    # deliberately NOT fed into the engine.
+    current_noi = summary.get("current_noi")
+    pro_forma_noi = summary.get("pro_forma_noi")
+    if current_noi is not None or pro_forma_noi is not None:
+        st.markdown("**Stated NOI — cross-check only (not used by the engine)**")
+        noi_rows = []
+        if current_noi is not None:
+            noi_rows.append(["Current NOI (stated in OM)", _money(current_noi)])
+        if pro_forma_noi is not None:
+            noi_rows.append(["Pro forma NOI (stated in OM)", _money(pro_forma_noi)])
+        st.markdown(_markdown_table(["Figure", "Annual amount"], noi_rows))
+        st.caption("Shown only to compare against the NOI the tool computes from your reviewed "
+                   "inputs. These never feed the engine — the deal's NOI is always recomputed.")
+
     for note in result.get("notes") or []:
         st.caption(f"• {note}")
+
+    # Short note: what was imported vs. what the user still has to enter (financing).
+    imported = []
+    if summary.get("offering_price") is not None:
+        imported.append("purchase price")
+    if rent_roll:
+        imported.append(f"rent roll ({len(rent_roll)} units)")
+    if any_expense:
+        imported.append("operating expenses")
+    if summary.get("vacancy_rate_pct") is not None:
+        imported.append("vacancy rate")
+    imported_text = ", ".join(imported) if imported else "nothing pre-fillable"
+    st.info(
+        f"**Imported:** {imported_text}.\n\n"
+        "**You still enter:** financing — loan amount / down payment (or LTV & DSCR to size "
+        "the loan), interest rate, and amortization — plus the hold & exit assumptions. An "
+        "offering memorandum doesn't contain a buyer's financing terms, so the tool never "
+        "extracts them."
+    )
 
     st.caption("⚠️ AI-extracted estimates — double-check every value before you run the numbers.")
 
@@ -611,60 +662,74 @@ def _apply_expense_template(property_type):
 
 
 def _seed_form_defaults():
-    """Put the sample deal into session_state once, as the starting form values."""
-    deal = engine.sample_deal
-    st.session_state.setdefault("name", deal["name"])
-    st.session_state.setdefault("purchase_price", float(deal["purchase_price"]))
-    st.session_state.setdefault("gross_rental_income", float(deal["gross_rental_income"]))
-    st.session_state.setdefault("vacancy_pct", deal["vacancy_rate"] * 100.0)
-    st.session_state.setdefault("operating_expenses", float(deal["operating_expenses"]))
-    # Operating expenses (Phase 9/12): property type + mode toggle + line-item inputs.
-    st.session_state.setdefault("property_type", deal.get("property_type", engine.DEFAULT_PROPERTY_TYPE))
-    st.session_state.setdefault("_applied_property_type", st.session_state["property_type"])
-    st.session_state.setdefault("number_of_units", int(deal["number_of_units"]))
-    # Income method (Phase A): default by property type; seed the rent roll from the sample.
-    st.session_state.setdefault(
-        "income_mode_label",
-        "Detailed (rent roll)" if engine.default_income_mode(st.session_state["property_type"]) == "detailed"
-        else "Simple (single total)",
-    )
+    """Seed a BLANK form into session_state once, as the starting values on launch.
+
+    The app starts empty — it does NOT auto-load the sample deal. Deal-specific inputs
+    (name, purchase price, income / rent roll, loan, down payment, renovation) start at
+    0 / blank, and the generic assumptions not tied to a property (vacancy, interest,
+    growth, selling cost) start at 0. What's KEPT is everything associated with the
+    PROPERTY TYPE: the expense-template line items (taxes %, insurance, management %,
+    repairs %, utilities, reserves, HOA) plus the income/expense/financing mode toggles.
+    A handful of fields whose widget requires a non-zero value (unit count, amortization,
+    hold, exit cap, LTV/DSCR) keep their conventional defaults — they can't be left at 0.
+
+    The sample deal still exists in engine.py and still backs "Load into form" for saved
+    deals and the assumption fallbacks; it just no longer pre-fills the blank launch form.
+    """
+    property_type = engine.DEFAULT_PROPERTY_TYPE
+    template = engine.EXPENSE_TEMPLATES[property_type]
+
+    # ---- Deal-specific inputs: start blank ----
+    st.session_state.setdefault("name", "")
+    st.session_state.setdefault("purchase_price", 0.0)
+    st.session_state.setdefault("gross_rental_income", 0.0)
+    st.session_state.setdefault("operating_expenses", 0.0)        # simple-mode total
+    st.session_state.setdefault("loan_amount", 0.0)
+    st.session_state.setdefault("down_payment", 0.0)
+    st.session_state.setdefault("renovation_cost_per_unit_input", 0.0)
+    st.session_state.setdefault("renovation_pace_input", 0.0)
+    # One empty rent-roll row, so the detailed table shows its structure to fill in.
     st.session_state.setdefault(
         "rent_roll",
-        [dict(u) for u in (deal.get("rent_roll")
-                           or engine.default_rent_roll(deal["number_of_units"], deal["gross_rental_income"]))],
+        [{"label": "Unit 1", "unit_type": "", "square_footage": None,
+          "monthly_rent": 0.0, "market_rent": None, "occupied": True}],
     )
+
+    # ---- Generic assumptions (not tied to a property type): start at 0 ----
+    st.session_state.setdefault("vacancy_pct", 0.0)
+    st.session_state.setdefault("interest_pct", 0.0)
+    st.session_state.setdefault("rent_growth_pct", 0.0)
+    st.session_state.setdefault("expense_growth_pct", 0.0)
+    st.session_state.setdefault("sell_cost_pct", 0.0)
+
+    # ---- Property type + its expense TEMPLATE: kept (these are the defaults that ARE
+    #      associated with the property type; changing the type below reloads them) ----
+    st.session_state.setdefault("property_type", property_type)
+    st.session_state.setdefault("_applied_property_type", st.session_state["property_type"])
+    st.session_state.setdefault("property_tax_pct", template["property_tax_rate"] * 100.0)
+    st.session_state.setdefault("insurance_annual", float(template["insurance_annual"]))
+    st.session_state.setdefault("hoa_annual", float(template["hoa_annual"]))
+    st.session_state.setdefault("management_pct_ui", template["management_pct"] * 100.0)
+    st.session_state.setdefault("repairs_pct_ui", template["repairs_pct"] * 100.0)
+    st.session_state.setdefault("utilities_annual", float(template["utilities_annual"]))
+    st.session_state.setdefault("reserves_per_unit", float(template["reserves_per_unit"]))
+
+    # ---- Selector / mode toggles: keep their property-type-driven defaults ----
     st.session_state.setdefault(
-        "expense_mode_label",
-        "Detailed (line items)" if deal.get("expense_mode") == "detailed" else "Simple (single total)",
+        "income_mode_label",
+        "Detailed (rent roll)" if engine.default_income_mode(property_type) == "detailed"
+        else "Simple (single total)",
     )
-    st.session_state.setdefault("property_tax_pct", deal["property_tax_rate"] * 100.0)
-    st.session_state.setdefault("insurance_annual", float(deal["insurance_annual"]))
-    st.session_state.setdefault("hoa_annual", float(deal.get("hoa_annual", 0.0)))
-    st.session_state.setdefault("management_pct_ui", deal["management_pct"] * 100.0)
-    st.session_state.setdefault("repairs_pct_ui", deal["repairs_pct"] * 100.0)
-    st.session_state.setdefault("utilities_annual", float(deal["utilities_annual"]))
-    st.session_state.setdefault("reserves_per_unit", float(deal["reserves_per_unit"]))
-    # Value-add (Phase C): renovation inputs.
-    st.session_state.setdefault("renovation_cost_per_unit_input", float(deal.get("renovation_cost_per_unit") or 0.0))
-    st.session_state.setdefault("renovation_pace_input", float(deal.get("renovation_pace") or 0.0))
-    st.session_state.setdefault("loan_amount", float(deal["loan_amount"]))
-    st.session_state.setdefault("interest_pct", deal["annual_interest_rate"] * 100.0)
-    st.session_state.setdefault("amortization_years", int(deal["amortization_years"]))
-    st.session_state.setdefault("down_payment", float(deal["down_payment"]))
-    # Financing (Phase B): manual vs sized, plus the sizing inputs.
-    st.session_state.setdefault(
-        "financing_mode_label",
-        "Size the loan (commercial)" if deal.get("financing_mode") == "sized"
-        else "Manual (enter loan / down payment)",
-    )
-    st.session_state.setdefault("ltv_max_pct", deal.get("ltv_max", engine.DEFAULT_LTV_MAX) * 100.0)
-    st.session_state.setdefault("dscr_min_input", deal.get("dscr_min", engine.DEFAULT_DSCR_MIN))
-    # Hold & exit assumptions (Phase 7-8); the % ones are shown as percent in the UI.
-    st.session_state.setdefault("hold_period_years", int(deal["hold_period_years"]))
-    st.session_state.setdefault("rent_growth_pct", deal["rent_growth"] * 100.0)
-    st.session_state.setdefault("expense_growth_pct", deal["expense_growth"] * 100.0)
-    st.session_state.setdefault("exit_cap_pct", deal["exit_cap_rate"] * 100.0)
-    st.session_state.setdefault("sell_cost_pct", deal["selling_cost_pct"] * 100.0)
+    st.session_state.setdefault("expense_mode_label", "Detailed (line items)")
+    st.session_state.setdefault("financing_mode_label", "Manual (enter loan / down payment)")
+
+    # ---- Fields whose widget forbids 0: conventional defaults (not deal-identifying) ----
+    st.session_state.setdefault("number_of_units", 1)
+    st.session_state.setdefault("amortization_years", 30)
+    st.session_state.setdefault("ltv_max_pct", engine.DEFAULT_LTV_MAX * 100.0)   # 75%
+    st.session_state.setdefault("dscr_min_input", engine.DEFAULT_DSCR_MIN)        # 1.25x
+    st.session_state.setdefault("hold_period_years", 5)
+    st.session_state.setdefault("exit_cap_pct", 6.5)
 
 
 def _apply_deal_to_form(deal):
@@ -731,18 +796,37 @@ def _apply_deal_to_form(deal):
     st.session_state["sell_cost_pct"] = float(deal.get("selling_cost_pct", defaults["selling_cost_pct"])) * 100.0
 
 
+# A rent roll with this many units imports as larger_multifamily (5+) rather than the
+# default small_multifamily; only the expense TEMPLATE differs, the underwriting math is
+# identical across types.
+LARGER_MULTIFAMILY_MIN_UNITS = 5
+
+
 def _apply_extraction_to_form(result):
-    """Pre-fill the rent-roll and expense inputs from an AI extraction result.
+    """Pre-fill the form's inputs from an AI extraction result.
 
     Only POPULATES the editable form fields (same session-state writes _apply_deal_to_form
     makes, so it must run before the input widgets are created). The user then reviews and
-    edits every value; the engine still does all the underwriting.
+    edits every value; the engine still does all the underwriting. Financing is never
+    touched — loan terms aren't in an OM and stay the user's to enter.
 
-    Income: a pulled rent roll switches Income to detailed mode and fills the table.
-    Expenses: the found line items load as a single operating-expense TOTAL in Simple mode —
-    a T-12 reports actual annual dollars, and detailed mode would force taxes/management/
-    repairs back onto %-of-price / %-of-income bases the statement doesn't give us.
+    - Offering price -> purchase price (the most important field; without it the rent roll
+      gets underwritten against a stale price).
+    - Stated vacancy rate -> vacancy input (only when the OM stated one; else left as is).
+    - Rent roll -> detailed Income mode + the unit table; 5+ units sets the property type
+      to larger multifamily (its expense template loads via the selectbox logic below).
+    - Expenses -> a single operating-expense TOTAL in Simple mode (a statement reports
+      actual annual dollars; detailed mode would need %-of-price / %-of-income bases the
+      statement doesn't give us).
+    - Stated NOI is shown for cross-check only and is deliberately NOT applied.
     """
+    summary = result.get("summary") or {}
+
+    if summary.get("offering_price") is not None:
+        st.session_state["purchase_price"] = float(summary["offering_price"])
+    if summary.get("vacancy_rate_pct") is not None:
+        st.session_state["vacancy_pct"] = float(summary["vacancy_rate_pct"])
+
     rent_roll = result.get("rent_roll") or []
     if rent_roll:
         st.session_state["rent_roll"] = [
@@ -759,6 +843,11 @@ def _apply_extraction_to_form(result):
         st.session_state.pop("rent_roll_editor", None)   # drop the editor's stale edits
         st.session_state["income_mode_label"] = "Detailed (rent roll)"
         st.session_state["number_of_units"] = max(len(rent_roll), 1)
+        # Property type by unit count: 5+ units -> larger multifamily. Leaving
+        # _applied_property_type unchanged lets the selectbox logic below load that
+        # type's expense template (and matching income default).
+        if len(rent_roll) >= LARGER_MULTIFAMILY_MIN_UNITS:
+            st.session_state["property_type"] = "larger_multifamily"
 
     expenses = result.get("operating_expenses") or {}
     found = {key: value for key, value in expenses.items() if value is not None}
@@ -902,34 +991,22 @@ if st.session_state.get("_applied_property_type") != property_type:
     )
     st.session_state["_applied_property_type"] = property_type
 
-property_col, financing_col = st.columns(2)
-
-with property_col:
-    st.markdown("**Property**")
-    purchase_price = st.number_input(
-        "Purchase price ($)", key="purchase_price",
-        min_value=0.0, step=5000.0, format="%.0f",
-        help="The price you pay for the property.",
-    )
-    vacancy_pct = st.number_input(
-        "Vacancy rate (%)", key="vacancy_pct",
-        min_value=0.0, max_value=100.0, step=0.5, format="%.2f",
-        help="Expected ongoing vacancy assumption — separate from any units currently "
-             "marked vacant in the rent roll.",
-    )
-
-with financing_col:
-    st.markdown("**Loan terms**")
-    interest_pct = st.number_input(
-        "Interest rate (%)", key="interest_pct",
-        min_value=0.0, max_value=30.0, step=0.125, format="%.3f",
-        help="Annual fixed mortgage rate.",
-    )
-    amortization_years = st.number_input(
-        "Amortization (years)", key="amortization_years",
-        min_value=1, max_value=40, step=1,
-        help="Years to fully pay the loan off.",
-    )
+# Property inputs. The loan terms (interest rate, amortization) used to sit beside
+# these; they now live together with the rest of the loan in the Financing section
+# below, so the whole loan is described in one place.
+st.markdown("**Property**")
+prop_col1, prop_col2 = st.columns(2)
+purchase_price = prop_col1.number_input(
+    "Purchase price ($)", key="purchase_price",
+    min_value=0.0, step=5000.0, format="%.0f",
+    help="The price you pay for the property.",
+)
+vacancy_pct = prop_col2.number_input(
+    "Vacancy rate (%)", key="vacancy_pct",
+    min_value=0.0, max_value=100.0, step=0.5, format="%.2f",
+    help="Expected ongoing vacancy assumption — separate from any units currently "
+         "marked vacant in the rent roll.",
+)
 
 # -----------------------------------------------------------------------------
 # Income (Phase A): a single gross total, or a detailed per-unit rent roll.
@@ -1082,8 +1159,10 @@ else:
         help="A single all-in operating-expense number for a quick look.",
     )
 
-# Assemble the deal so far (income + expenses + loan terms). Financing and the hold &
-# exit assumptions are added below. NOI must be known before the loan can be sized.
+# Assemble the deal so far (income + expenses). Financing (loan terms + amount) and
+# the hold & exit assumptions are added below. NOI must be known before the loan can
+# be sized, and NOI doesn't depend on the loan, so the loan terms are set in the
+# Financing section rather than here.
 current_deal = {
     "name": st.session_state["name"],
     "property_type": property_type,
@@ -1093,8 +1172,6 @@ current_deal = {
     "gross_rental_income": gross_rental_income,
     "rent_roll": rent_roll,
     "vacancy_rate": vacancy_pct / 100.0,
-    "annual_interest_rate": interest_pct / 100.0,
-    "amortization_years": int(amortization_years),
     "expense_mode": "detailed" if expense_detailed else "simple",
     "operating_expenses": st.session_state["operating_expenses"],
     "property_tax_rate": st.session_state["property_tax_pct"] / 100.0,
@@ -1118,7 +1195,10 @@ noi_now = engine.calculate_noi(
 )
 
 # -----------------------------------------------------------------------------
-# Financing (Phase B): manual loan/down, or size the loan from lender limits.
+# Financing (Phase B): the whole loan in one place — the manual-vs-sized mode, the
+# interest rate and amortization, and either the loan/down payment or the LTV/DSCR
+# limits to size it from. (Interest rate and amortization used to sit in a separate
+# "Loan terms" box by Property; they're consolidated here.)
 # -----------------------------------------------------------------------------
 st.markdown("**Financing**")
 financing_mode_label = st.radio(
@@ -1129,6 +1209,21 @@ financing_mode_label = st.radio(
          "the max-LTV and min-DSCR limits, using this deal's NOI.",
 )
 financing_sized = financing_mode_label.startswith("Size")
+
+# Loan terms apply to both modes (and the sizing below needs them), so they come first.
+rate_col, amort_col = st.columns(2)
+interest_pct = rate_col.number_input(
+    "Interest rate (%)", key="interest_pct",
+    min_value=0.0, max_value=30.0, step=0.125, format="%.3f",
+    help="Annual fixed mortgage rate.",
+)
+amortization_years = amort_col.number_input(
+    "Amortization (years)", key="amortization_years",
+    min_value=1, max_value=40, step=1,
+    help="Years to fully pay the loan off.",
+)
+current_deal["annual_interest_rate"] = interest_pct / 100.0
+current_deal["amortization_years"] = int(amortization_years)
 
 if financing_sized:
     fin_col1, fin_col2 = st.columns(2)

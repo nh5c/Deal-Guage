@@ -1,9 +1,14 @@
 """AI document extraction (Phase D).
 
-Turn an uploaded rent roll and/or operating statement (T-12) into STRUCTURED data
-that PRE-FILLS the existing rent-roll and expense inputs. The user then reviews and
+Turn an uploaded rent roll, operating statement (T-12), and/or offering memorandum
+(OM) into STRUCTURED data that PRE-FILLS the existing inputs: the rent-roll table,
+the expense inputs, and (from an OM) the purchase price and vacancy rate. It also
+pulls the OM's stated NOI as a display-only cross-check. The user then reviews and
 edits every value, and the deterministic engine does the underwriting. AI does the
 data-in only — it never makes the buy/pass decision, and the engine never changes.
+
+Loan / financing terms are deliberately NOT extracted: interest rate, amortization,
+LTV, and DSCR are the buyer's decisions, not facts in an OM. The user enters those.
 
 Design notes (deliberately mirrors rentcast.py):
   - No Streamlit, no SQL, no engine import. This module only knows how to read a
@@ -58,6 +63,10 @@ REQUEST_TIMEOUT_SECONDS = 60
 # returns these as ANNUAL dollar amounts (or None), in this fixed order.
 EXPENSE_KEYS = ["taxes", "insurance", "management", "repairs", "utilities", "reserves", "hoa"]
 
+# Property-summary fields pulled from an offering memorandum. offering_price and
+# vacancy_rate_pct PRE-FILL inputs; the two NOI figures are display-only cross-checks.
+SUMMARY_KEYS = ["offering_price", "vacancy_rate_pct", "current_noi", "pro_forma_noi"]
+
 # File extensions we know how to send to the API.
 PDF_EXTENSIONS = {"pdf"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
@@ -85,17 +94,25 @@ _IMAGE_MEDIA_TYPES = {
 # -----------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "You are a careful data-entry assistant for a commercial real estate "
-    "underwriting tool. You read rent rolls and operating statements (T-12s) and "
-    "report the figures EXACTLY as stated, as strict JSON. You never estimate, "
-    "guess, or invent numbers: if a value is not in the document, you return null. "
-    "You return ONLY the JSON object, with no commentary, explanation, or markdown."
+    "underwriting tool. You read rent rolls, operating statements (T-12s), and "
+    "offering memorandums (OMs), and report the figures EXACTLY as stated, as strict "
+    "JSON. You never estimate, guess, or invent numbers: if a value is not in the "
+    "document, you return null. You never report loan or financing terms (the buyer "
+    "decides those). You return ONLY the JSON object, with no commentary, "
+    "explanation, or markdown."
 )
 
 EXTRACTION_INSTRUCTIONS = """\
-Extract the rent roll and operating expenses from the attached document(s) into \
-this EXACT JSON shape:
+Extract the property summary, rent roll, and operating expenses from the attached \
+document(s) into this EXACT JSON shape:
 
 {
+  "summary": {
+    "offering_price": <the stated Offering Price / Asking Price / List Price in dollars, or null>,
+    "vacancy_rate_pct": <the stated vacancy or vacancy-allowance PERCENT, e.g. 3 for "3% vacancy", or null>,
+    "current_noi": <the stated CURRENT net operating income in annual dollars, or null>,
+    "pro_forma_noi": <the stated PRO FORMA / projected net operating income in annual dollars, or null>
+  },
   "rent_roll": [
     {
       "label": "unit label or number exactly as written, e.g. \\"101\\" or \\"Unit A\\"",
@@ -122,6 +139,13 @@ Rules:
 - Return ONLY the JSON object above. No prose, no markdown code fences, no explanation.
 - Use null for anything not found. Do NOT guess or estimate a value the document does not state.
 - Every money value is a PLAIN NUMBER in dollars (e.g. 1450, not "$1,450.00").
+- offering_price: the asking/offering/list price from the property summary, as a number.
+- vacancy_rate_pct: ONLY a clearly stated vacancy or vacancy-allowance rate, as a percent number
+  (e.g. 3 for "3% vacancy allowance"). An OCCUPANCY figure is NOT a vacancy rate — "100% occupied"
+  or "95% occupied" describes current occupancy, so return null for vacancy_rate_pct in that case.
+- current_noi / pro_forma_noi: the stated NOI figures, for cross-checking only.
+- Do NOT report any loan or financing terms (interest rate, amortization, LTV, DSCR, debt service).
+  Those are the buyer's decisions and are not part of this extraction — never include them.
 - All operating-expense amounts must be ANNUAL. If a figure is monthly, multiply by 12;
   if it covers a partial year, annualize it and say so in "notes".
 - If the document has only a rent roll, return "operating_expenses" with every value null.
@@ -445,16 +469,44 @@ def _clean_operating_expenses(raw, notes):
     return expenses
 
 
+def _clean_summary(raw, notes):
+    """Validate the property-summary block into the fixed {key: value|None} dict.
+
+    offering_price / current_noi / pro_forma_noi are non-negative dollar amounts;
+    vacancy_rate_pct is a percent in 0-100 (an out-of-range value is dropped + noted)."""
+    summary = {key: None for key in SUMMARY_KEYS}
+    if not isinstance(raw, dict):
+        return summary
+
+    summary["offering_price"] = _to_amount(raw.get("offering_price"))
+    summary["current_noi"] = _to_amount(raw.get("current_noi"))
+    summary["pro_forma_noi"] = _to_amount(raw.get("pro_forma_noi"))
+
+    vacancy = _to_amount(raw.get("vacancy_rate_pct"))
+    if vacancy is not None and vacancy > 100:
+        notes.append(f"Ignored an out-of-range vacancy rate ({vacancy}%).")
+        vacancy = None
+    summary["vacancy_rate_pct"] = vacancy
+
+    # Note any present-but-unreadable dollar figures (vacancy is handled above).
+    for key in ("offering_price", "current_noi", "pro_forma_noi"):
+        raw_value = raw.get(key)
+        if summary[key] is None and raw_value not in (None, ""):
+            notes.append(f"Couldn't read {key.replace('_', ' ')} ({raw_value!r}).")
+    return summary
+
+
 def parse_extraction(text):
     """Parse + validate a model reply into structured data. Never raises.
 
-    Returns {"rent_roll": [...], "operating_expenses": {...}, "notes": [...]} on
-    success, or None if no JSON object could be recovered from the reply at all."""
+    Returns {"summary": {...}, "rent_roll": [...], "operating_expenses": {...},
+    "notes": [...]} on success, or None if no JSON object could be recovered at all."""
     parsed = _locate_json(text)
     if parsed is None:
         return None
 
     notes = []
+    summary = _clean_summary(parsed.get("summary"), notes)
     rent_roll = _clean_rent_roll(parsed.get("rent_roll"), notes)
     operating_expenses = _clean_operating_expenses(parsed.get("operating_expenses"), notes)
 
@@ -462,7 +514,12 @@ def parse_extraction(text):
     if isinstance(model_note, str) and model_note.strip():
         notes.append(model_note.strip())
 
-    return {"rent_roll": rent_roll, "operating_expenses": operating_expenses, "notes": notes}
+    return {
+        "summary": summary,
+        "rent_roll": rent_roll,
+        "operating_expenses": operating_expenses,
+        "notes": notes,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -512,6 +569,7 @@ def extract_from_documents(files):
     return {
         "ok": True,
         "model": MODEL,
+        "summary": structured["summary"],
         "rent_roll": structured["rent_roll"],
         "operating_expenses": structured["operating_expenses"],
         # Skipped-file notes first, then any validation/model notes.
@@ -540,6 +598,10 @@ if __name__ == "__main__":
     sample_reply = """Here is the data:
     ```json
     {
+      "summary": {
+        "offering_price": "$3,150,000", "vacancy_rate_pct": 3,
+        "current_noi": 188000, "pro_forma_noi": 215000
+      },
       "rent_roll": [
         {"label": "101", "unit_type": "2BR/1BA", "square_footage": 850,
          "monthly_rent": 1450, "market_rent": 1600, "occupied": true},
@@ -557,11 +619,20 @@ if __name__ == "__main__":
     ```"""
     structured = parse_extraction(sample_reply)
     print("\nParsed sample reply:")
+    print(f"  summary: {structured['summary']}")
     print(f"  units: {len(structured['rent_roll'])}")
     for unit in structured["rent_roll"]:
         print(f"    {unit}")
     print(f"  expenses: {structured['operating_expenses']}")
     print(f"  notes: {structured['notes']}")
+
+    # ---- Offline check 2b: occupancy must NOT become a vacancy rate, out-of-range dropped ----
+    occ_reply = '{"summary": {"vacancy_rate_pct": null}, "rent_roll": [], "operating_expenses": {}}'
+    print(f"\n'100% occupied' style reply -> vacancy: "
+          f"{parse_extraction(occ_reply)['summary']['vacancy_rate_pct']} (should be None)")
+    bad_vac = parse_extraction('{"summary": {"vacancy_rate_pct": 250}}')
+    print(f"out-of-range vacancy (250) -> {bad_vac['summary']['vacancy_rate_pct']} "
+          f"(should be None), notes: {bad_vac['notes']}")
 
     # ---- Offline check 3: _to_amount edge cases ----
     print("\n_to_amount edge cases:")
@@ -574,8 +645,14 @@ if __name__ == "__main__":
         print("\nNo ANTHROPIC_API_KEY set — skipping the live call.")
         print(f"  extract_from_documents([]) -> {extract_from_documents([('x.csv', b'a')])['error_type']}")
     else:
-        # ---- Live call: one tiny CSV through the real API ----
+        # ---- Live call: one tiny OM-style document through the real API ----
         sample_csv = (
+            "Maplewood Apartments — Offering Summary\n"
+            "Offering Price: $3,150,000\n"
+            "Vacancy allowance: 3%\n"
+            "Current NOI: $188,000   Pro Forma NOI: $215,000\n"
+            "\n"
+            "Rent roll:\n"
             "Unit,Type,SqFt,Current Rent,Market Rent,Status\n"
             "101,2BR/1BA,850,1450,1600,Occupied\n"
             "102,2BR/1BA,850,1400,1600,Occupied\n"
@@ -589,6 +666,6 @@ if __name__ == "__main__":
             "Utilities,3000\n"
             "Reserves,1200\n"
         ).encode("utf-8")
-        print("\nMaking ONE live API call on a sample CSV…")
+        print("\nMaking ONE live API call on a sample OM…")
         result = extract_from_documents([("sample.csv", sample_csv)])
         print(json.dumps(result, indent=2))
