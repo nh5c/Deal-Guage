@@ -1,8 +1,14 @@
-"""SQLite storage for saving and loading deals (Phase 3).
+"""Storage for saving and loading deals (Phase 3; Postgres backend added for deploy).
 
-Uses Python's built-in sqlite3 module — no third-party dependency. All deals live
-in a single file, data/deals.db, which is git-ignored so real deal data is never
-committed.
+Two interchangeable backends, chosen at runtime by the DATABASE_URL environment variable:
+  - DATABASE_URL set (production / Render): connect to PostgreSQL at that URL.
+  - DATABASE_URL unset (local dev): the built-in sqlite3 file at data/deals.db, exactly
+    as before — no Postgres server or extra setup needed locally.
+
+All database access is isolated here; the engine and dashboard don't know which backend
+is active. The public functions (initialize_database, save_deal, load_deal, list_deals)
+have identical signatures and behavior on both. The SQL dialect differences (placeholder
+style, autoincrement keys, returning the new id) are handled by a few small helpers.
 
 We store only the raw inputs a user enters (the same keys as engine.sample_deal),
 never the computed metrics. NOI, cap rate, DSCR, and the buy/pass verdict are
@@ -12,6 +18,8 @@ Run the demo with:  python cre_underwriter/database.py
 """
 
 import json
+import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -114,8 +122,50 @@ CREATE TABLE IF NOT EXISTS deals (
 )
 """
 
+# The same table for PostgreSQL. Two dialect differences from the SQLite version above:
+#   - id: SERIAL PRIMARY KEY (Postgres auto-increment) instead of INTEGER PRIMARY KEY
+#     AUTOINCREMENT.
+#   - money/rate columns: DOUBLE PRECISION (Postgres has no flexible REAL affinity).
+# Everything else (TEXT, INTEGER, NOT NULL, DEFAULT, the JSON-text rent_roll, the owner
+# column) is identical, so a fresh Postgres database initializes itself with the full
+# per-user schema on first run.
+CREATE_DEALS_TABLE_POSTGRES = """
+CREATE TABLE IF NOT EXISTS deals (
+    id                   SERIAL  PRIMARY KEY,
+    name                 TEXT    NOT NULL,
+    purchase_price       DOUBLE PRECISION NOT NULL,
+    number_of_units      INTEGER,
+    gross_rental_income  DOUBLE PRECISION NOT NULL,
+    income_mode          TEXT    NOT NULL DEFAULT 'simple',
+    rent_roll            TEXT,
+    vacancy_rate         DOUBLE PRECISION NOT NULL,
+    expense_mode         TEXT    NOT NULL DEFAULT 'simple',
+    property_type        TEXT    NOT NULL DEFAULT 'small_multifamily',
+    operating_expenses   DOUBLE PRECISION,
+    property_tax_rate    DOUBLE PRECISION,
+    insurance_annual     DOUBLE PRECISION,
+    hoa_annual           DOUBLE PRECISION,
+    management_pct       DOUBLE PRECISION,
+    repairs_pct          DOUBLE PRECISION,
+    utilities_annual     DOUBLE PRECISION,
+    reserves_per_unit    DOUBLE PRECISION,
+    loan_amount          DOUBLE PRECISION NOT NULL,
+    annual_interest_rate DOUBLE PRECISION NOT NULL,
+    amortization_years   INTEGER NOT NULL,
+    down_payment         DOUBLE PRECISION NOT NULL,
+    financing_mode       TEXT    NOT NULL DEFAULT 'manual',
+    ltv_max              DOUBLE PRECISION,
+    dscr_min             DOUBLE PRECISION,
+    renovation_cost_per_unit DOUBLE PRECISION,
+    renovation_pace          DOUBLE PRECISION,
+    created_at           TEXT    NOT NULL,
+    owner                TEXT
+)
+"""
+
 # Named (:field) placeholders, so values are safely parameterized rather than
-# pasted into the SQL string. The names match the keys in a deal dict.
+# pasted into the SQL string. The names match the keys in a deal dict. These are
+# SQLite-style; _q() rewrites them to %(field)s for Postgres.
 INSERT_DEAL_SQL = """
 INSERT INTO deals (
     name, purchase_price, number_of_units, gross_rental_income, income_mode, rent_roll,
@@ -160,12 +210,67 @@ OPTIONAL_COLUMN_DEFAULTS = {
 }
 
 
-def _connect(db_path):
-    """Open the SQLite file and enable name-based access to columns."""
+# -----------------------------------------------------------------------------
+# Backend selection + dialect helpers.
+#
+# DATABASE_URL set  -> PostgreSQL (production / Render).  DATABASE_URL unset -> SQLite.
+# Queries are written in the SQLite style (:name and ?), and translated for Postgres.
+# -----------------------------------------------------------------------------
+DATABASE_URL_ENV = "DATABASE_URL"
+
+
+def _database_url():
+    """The Postgres connection URL from the environment, or None for local SQLite.
+
+    Render (and some providers) hand out 'postgres://...' URLs, but psycopg2/SQLAlchemy
+    want the 'postgresql://...' scheme — normalize that here. No credential is ever
+    hardcoded; this only reads the env var the platform provides."""
+    url = os.environ.get(DATABASE_URL_ENV)
+    if not url:
+        return None
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def _is_postgres():
+    """True when a DATABASE_URL is configured (use PostgreSQL), else SQLite."""
+    return _database_url() is not None
+
+
+def _q(query):
+    """Translate a query's placeholders for the active backend.
+
+    Queries here use the SQLite style: :name for named params, ? for positional.
+    Postgres/psycopg2 wants %(name)s and %s. Each query uses ONE style, so the mapping
+    is unambiguous. (For SQLite the query is returned unchanged.)"""
+    if not _is_postgres():
+        return query
+    query = re.sub(r":(\w+)", r"%(\1)s", query)   # :name -> %(name)s
+    return query.replace("?", "%s")               # ?     -> %s
+
+
+def _connect(db_path=DATABASE_PATH):
+    """Open a connection to the active backend.
+
+    PostgreSQL when DATABASE_URL is set (psycopg2 is imported lazily, so local dev needs
+    no Postgres driver loaded); otherwise the local SQLite file. On both, rows read back
+    behave like dicts (row["name"]) so the calling code is identical."""
+    url = _database_url()
+    if url:
+        import psycopg2   # lazy: only needed in production / when DATABASE_URL is set
+        return psycopg2.connect(url)
     connection = sqlite3.connect(db_path)
-    # With this row factory, a row behaves like a dict: row["name"], row["id"].
-    connection.row_factory = sqlite3.Row
+    connection.row_factory = sqlite3.Row   # rows behave like dicts: row["name"], row["id"]
     return connection
+
+
+def _dict_cursor(connection):
+    """A cursor whose rows behave like dicts on both backends."""
+    if _is_postgres():
+        import psycopg2.extras
+        return connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    return connection.cursor()   # inherits the sqlite3.Row factory from the connection
 
 
 def _add_missing_columns(connection):
@@ -200,14 +305,25 @@ def _add_missing_columns(connection):
 
 
 def initialize_database(db_path=DATABASE_PATH):
-    """Create the data/ folder and the deals table if they don't already exist.
+    """Create the deals table for the active backend if it doesn't already exist.
 
-    Safe to call every time the app starts: 'CREATE TABLE IF NOT EXISTS' does
-    nothing when the table is already there, so it never wipes existing data.
+    Safe to call every time the app starts: 'CREATE TABLE IF NOT EXISTS' does nothing
+    when the table is already there, so it never wipes existing data. A fresh Postgres
+    database (e.g. a new Render instance) initializes itself with the full per-user schema.
     """
-    # Make sure the folder for the .db file exists before sqlite3 opens it.
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    if _is_postgres():
+        connection = _connect(db_path)
+        try:
+            cursor = connection.cursor()
+            cursor.execute(CREATE_DEALS_TABLE_POSTGRES)
+            connection.commit()
+        finally:
+            connection.close()
+        return
 
+    # SQLite (local dev): same as before, including the in-place column upgrades that
+    # bring an older local data/deals.db up to the current schema.
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)   # make the data/ folder
     connection = _connect(db_path)
     try:
         connection.execute(CREATE_DEALS_TABLE_SQL)
@@ -238,9 +354,15 @@ def save_deal(deal, owner=None, db_path=DATABASE_PATH):
 
     connection = _connect(db_path)
     try:
-        cursor = connection.execute(INSERT_DEAL_SQL, parameters)
+        cursor = _dict_cursor(connection)
+        if _is_postgres():
+            # psycopg2 has no lastrowid — ask Postgres to hand the new id straight back.
+            cursor.execute(_q(INSERT_DEAL_SQL) + " RETURNING id", parameters)
+            new_id = cursor.fetchone()["id"]
+        else:
+            cursor.execute(_q(INSERT_DEAL_SQL), parameters)
+            new_id = cursor.lastrowid   # the id SQLite just auto-assigned to this row
         connection.commit()
-        new_id = cursor.lastrowid  # the id SQLite just auto-assigned to this row
     finally:
         connection.close()
 
@@ -256,11 +378,12 @@ def load_deal(deal_id, owner=None, db_path=DATABASE_PATH):
     """
     connection = _connect(db_path)
     try:
+        cursor = _dict_cursor(connection)
         if owner is None:
-            cursor = connection.execute("SELECT * FROM deals WHERE id = ?", (deal_id,))
+            cursor.execute(_q("SELECT * FROM deals WHERE id = ?"), (deal_id,))
         else:
-            cursor = connection.execute(
-                "SELECT * FROM deals WHERE id = ? AND owner = ?", (deal_id, owner)
+            cursor.execute(
+                _q("SELECT * FROM deals WHERE id = ? AND owner = ?"), (deal_id, owner)
             )
         row = cursor.fetchone()
     finally:
@@ -290,13 +413,12 @@ def list_deals(owner=None, db_path=DATABASE_PATH):
     """
     connection = _connect(db_path)
     try:
+        cursor = _dict_cursor(connection)
         if owner is None:
-            cursor = connection.execute(
-                "SELECT id, name, created_at FROM deals ORDER BY id"
-            )
+            cursor.execute(_q("SELECT id, name, created_at FROM deals ORDER BY id"))
         else:
-            cursor = connection.execute(
-                "SELECT id, name, created_at FROM deals WHERE owner = ? ORDER BY id",
+            cursor.execute(
+                _q("SELECT id, name, created_at FROM deals WHERE owner = ? ORDER BY id"),
                 (owner,),
             )
         rows = cursor.fetchall()

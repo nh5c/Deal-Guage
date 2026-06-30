@@ -11,6 +11,7 @@ streamlit>=1.42          # Phase 4: dashboard UI (>=1.42 for native OIDC st.logi
 requests>=2.31           # Phase 5: RentCast client + Phase D: Anthropic API client
 fpdf2>=2.7               # Phase E: render the deal memo to a one-page PDF
 Authlib>=1.3.2           # Phase F: Google sign-in (required by Streamlit's st.login OIDC)
+psycopg2-binary>=2.9     # Phase G: PostgreSQL backend (used only when DATABASE_URL is set)
 
 # Phase D needs an Anthropic API key in the ANTHROPIC_API_KEY environment variable
 # (https://console.anthropic.com). Without it, manual entry still works; AI import
