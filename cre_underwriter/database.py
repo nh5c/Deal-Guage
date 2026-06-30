@@ -109,7 +109,8 @@ CREATE TABLE IF NOT EXISTS deals (
     dscr_min             REAL,
     renovation_cost_per_unit REAL,
     renovation_pace          REAL,
-    created_at           TEXT    NOT NULL
+    created_at           TEXT    NOT NULL,
+    owner                TEXT
 )
 """
 
@@ -122,14 +123,14 @@ INSERT INTO deals (
     insurance_annual, hoa_annual, management_pct, repairs_pct, utilities_annual,
     reserves_per_unit, loan_amount, annual_interest_rate, amortization_years,
     down_payment, financing_mode, ltv_max, dscr_min,
-    renovation_cost_per_unit, renovation_pace, created_at
+    renovation_cost_per_unit, renovation_pace, created_at, owner
 ) VALUES (
     :name, :purchase_price, :number_of_units, :gross_rental_income, :income_mode, :rent_roll,
     :vacancy_rate, :expense_mode, :property_type, :operating_expenses, :property_tax_rate,
     :insurance_annual, :hoa_annual, :management_pct, :repairs_pct, :utilities_annual,
     :reserves_per_unit, :loan_amount, :annual_interest_rate, :amortization_years,
     :down_payment, :financing_mode, :ltv_max, :dscr_min,
-    :renovation_cost_per_unit, :renovation_pace, :created_at
+    :renovation_cost_per_unit, :renovation_pace, :created_at, :owner
 )
 """
 
@@ -155,6 +156,7 @@ OPTIONAL_COLUMN_DEFAULTS = {
     "dscr_min": None,
     "renovation_cost_per_unit": None,
     "renovation_pace": None,
+    "owner": None,
 }
 
 
@@ -191,6 +193,10 @@ def _add_missing_columns(connection):
         connection.execute("ALTER TABLE deals ADD COLUMN renovation_cost_per_unit REAL")
     if "renovation_pace" not in existing:
         connection.execute("ALTER TABLE deals ADD COLUMN renovation_pace REAL")
+    # Per-user ownership (auth). Existing rows get NULL owner — legacy/global deals
+    # that the app hides from signed-in users (they only see their own).
+    if "owner" not in existing:
+        connection.execute("ALTER TABLE deals ADD COLUMN owner TEXT")
 
 
 def initialize_database(db_path=DATABASE_PATH):
@@ -211,8 +217,13 @@ def initialize_database(db_path=DATABASE_PATH):
         connection.close()
 
 
-def save_deal(deal, db_path=DATABASE_PATH):
-    """Insert one deal (a dict of raw inputs) and return its new integer id."""
+def save_deal(deal, owner=None, db_path=DATABASE_PATH):
+    """Insert one deal (a dict of raw inputs) and return its new integer id.
+
+    `owner` tags the deal with the signed-in user's identity (their email) so the app
+    can show each user only their own deals. The owner argument always wins over any
+    owner key the deal dict might carry.
+    """
     # Stamp the moment we saved it as ISO-8601 local time (sorts chronologically).
     created_at = datetime.now().isoformat(timespec="seconds")
 
@@ -220,7 +231,7 @@ def save_deal(deal, db_path=DATABASE_PATH):
     # Optional-column defaults fill any expense fields the deal omits; extra keys a
     # deal might carry (id, hold/exit assumptions) are ignored by the named
     # placeholders in INSERT_DEAL_SQL.
-    parameters = {**OPTIONAL_COLUMN_DEFAULTS, **deal, "created_at": created_at}
+    parameters = {**OPTIONAL_COLUMN_DEFAULTS, **deal, "created_at": created_at, "owner": owner}
     # The rent roll is a list of unit dicts — store it as JSON text (see load_deal).
     rent_roll = parameters.get("rent_roll")
     parameters["rent_roll"] = json.dumps(rent_roll) if rent_roll is not None else None
@@ -236,11 +247,21 @@ def save_deal(deal, db_path=DATABASE_PATH):
     return new_id
 
 
-def load_deal(deal_id, db_path=DATABASE_PATH):
-    """Load one deal by id and return it as a dict (or None if no such id)."""
+def load_deal(deal_id, owner=None, db_path=DATABASE_PATH):
+    """Load one deal by id and return it as a dict (or None if no such id).
+
+    When `owner` is given, the load is scoped to that owner: a deal belonging to a
+    different user (or a legacy NULL-owner deal) returns None rather than loading,
+    so a user can never open another user's deal by guessing its id.
+    """
     connection = _connect(db_path)
     try:
-        cursor = connection.execute("SELECT * FROM deals WHERE id = ?", (deal_id,))
+        if owner is None:
+            cursor = connection.execute("SELECT * FROM deals WHERE id = ?", (deal_id,))
+        else:
+            cursor = connection.execute(
+                "SELECT * FROM deals WHERE id = ? AND owner = ?", (deal_id, owner)
+            )
         row = cursor.fetchone()
     finally:
         connection.close()
@@ -260,13 +281,24 @@ def load_deal(deal_id, db_path=DATABASE_PATH):
     return deal
 
 
-def list_deals(db_path=DATABASE_PATH):
-    """Return saved deals as a list of dicts (id, name, created_at), oldest first."""
+def list_deals(owner=None, db_path=DATABASE_PATH):
+    """Return saved deals as a list of dicts (id, name, created_at), oldest first.
+
+    When `owner` is given, only that owner's deals are returned — legacy deals with a
+    NULL owner are never matched, so they stay hidden from signed-in users. When owner
+    is None (e.g. the module demo), every deal is returned.
+    """
     connection = _connect(db_path)
     try:
-        cursor = connection.execute(
-            "SELECT id, name, created_at FROM deals ORDER BY id"
-        )
+        if owner is None:
+            cursor = connection.execute(
+                "SELECT id, name, created_at FROM deals ORDER BY id"
+            )
+        else:
+            cursor = connection.execute(
+                "SELECT id, name, created_at FROM deals WHERE owner = ? ORDER BY id",
+                (owner,),
+            )
         rows = cursor.fetchall()
     finally:
         connection.close()

@@ -12,7 +12,9 @@ only database.py changes — this file never touches a connection.
 Run it with:  streamlit run cre_underwriter/dashboard.py
 """
 
+import base64
 import re
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -21,19 +23,448 @@ import streamlit as st
 # `streamlit run cre_underwriter/dashboard.py` (script folder on the path) and as
 # part of the package.
 try:
-    from cre_underwriter import engine, database, rentcast, extraction
+    from cre_underwriter import engine, database, rentcast, extraction, deal_memo
 except ModuleNotFoundError:
     import engine
     import database
     import rentcast
     import extraction
+    import deal_memo
+
+
+# -----------------------------------------------------------------------------
+# Brand assets (DealGauge logo + mark). See DESIGN.md. SVGs are embedded inline via
+# HTML (st.image doesn't render raw SVG cleanly), and the favicon is passed to
+# set_page_config as a data URI built from the gauge mark.
+# -----------------------------------------------------------------------------
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+
+
+def _asset_text(name):
+    """Read an SVG (or text) asset; return '' if it's missing so the app still runs."""
+    try:
+        return (ASSETS_DIR / name).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _favicon():
+    """The page icon: the gauge mark as an SVG data URI, or a neutral fallback."""
+    svg = _asset_text("dealgauge-mark.svg")
+    if not svg:
+        return ":bar_chart:"   # harmless fallback if the asset is missing
+    encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
 
 
 # st.set_page_config must be the first Streamlit call.
-st.set_page_config(page_title="CRE Underwriter", page_icon="🏢", layout="centered")
+st.set_page_config(page_title="DealGauge", page_icon=_favicon(), layout="centered")
 
 # Make sure the table exists before we read or write. This is idempotent.
 database.initialize_database()
+
+
+# -----------------------------------------------------------------------------
+# Design system (DESIGN.md): palette, typography, cards, metric tiles, tables.
+# Native theming lives in .streamlit/config.toml; this CSS layers the rest on top.
+# Brass is the single accent and is used sparingly (the logo + one header hairline).
+# -----------------------------------------------------------------------------
+DESIGN_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+  --dg-navy:#12182B; --dg-navy2:#1A2238; --dg-brass:#C2A35E; --dg-cream:#ECE6D6;
+  --dg-paper:#FBFAF7; --dg-ink:#1A2238; --dg-muted:#5B6275; --dg-hair:#E2DFD6;
+  --dg-card:#FCFBF8; --dg-tint:#F1ECDE;
+  --dg-green:#2E7D4F; --dg-red:#B23A3A; --dg-amber:#B8860B;
+}
+
+/* Base typography + background */
+html, body, [class*="css"], .stApp,
+[data-testid="stMarkdownContainer"], [data-testid="stWidgetLabel"] {
+  font-family: 'Inter','Segoe UI', system-ui, -apple-system, sans-serif;
+}
+.stApp { background: var(--dg-paper); color: var(--dg-ink); }
+[data-testid="stHeader"] { background: transparent; }
+footer { visibility: hidden; }
+
+/* Document-width content, generous top space */
+.block-container, [data-testid="stMainBlockContainer"] {
+  max-width: 880px; padding-top: 2.2rem; padding-bottom: 4rem;
+}
+
+/* Headings */
+h1, h2, h3, h4, h5 { color: var(--dg-navy); letter-spacing: -0.01em; }
+h1 { font-weight: 700; }
+h2, h3, h4 { font-weight: 600; }
+
+/* Brand header: logo with clear space + a single precious brass hairline */
+.dg-header { padding: 4px 0 18px; border-bottom: 2px solid var(--dg-brass); margin: 0 0 8px; }
+.dg-logo svg { height: 60px; width: auto; display: block; }
+
+/* Section card titles (inside bordered cards) */
+.dg-card-title {
+  font-size: 1.02rem; font-weight: 600; color: var(--dg-navy);
+  margin: 2px 0 12px; padding: 0;
+}
+
+/* Bordered containers -> design cards (sections, results panels, memo) */
+[data-testid="stVerticalBlockBorderWrapper"] {
+  border: 1px solid var(--dg-hair) !important; border-radius: 12px;
+  background: var(--dg-card); padding: 18px 22px; margin-bottom: 16px;
+}
+
+/* Metric tiles: small uppercase label over a tabular value. The value is sized to
+   fit multi-million-dollar figures in a 4-across tile row (e.g. the Financing section)
+   without truncating — tabular figures keep columns aligned. */
+[data-testid="stMetric"] {
+  border: 1px solid var(--dg-hair); border-radius: 10px;
+  background: var(--dg-card); padding: 12px 14px;
+}
+[data-testid="stMetricLabel"] p {
+  text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.06em;
+  font-weight: 600; color: var(--dg-muted);
+}
+[data-testid="stMetricValue"] {
+  color: var(--dg-navy); font-weight: 700; font-variant-numeric: tabular-nums;
+  font-size: 1.35rem; line-height: 1.2; white-space: nowrap;
+}
+[data-testid="stMetricValue"] > div { overflow: visible; }
+
+/* Hairline tables (markdown tables: rent roll / pro forma / expenses / memo) */
+[data-testid="stMarkdownContainer"] table {
+  border-collapse: collapse; width: 100%; margin: 4px 0 10px;
+  font-variant-numeric: tabular-nums;
+}
+[data-testid="stMarkdownContainer"] thead th {
+  background: var(--dg-tint); color: var(--dg-navy2); text-align: left;
+  text-transform: uppercase; font-size: 0.70rem; letter-spacing: 0.05em;
+  font-weight: 600; padding: 9px 12px; border: none; border-bottom: 1px solid var(--dg-hair);
+}
+[data-testid="stMarkdownContainer"] tbody td {
+  padding: 8px 12px; border: none; border-bottom: 1px solid #ECE8DD; font-size: 0.92rem;
+}
+[data-testid="stMarkdownContainer"] tbody tr:last-child td { border-bottom: none; }
+
+/* Buttons: primary = Ink Navy with cream text; secondary = navy outline */
+.stButton button, .stDownloadButton button { border-radius: 8px; font-weight: 600; }
+.stButton button[kind="primary"], [data-testid="stBaseButton-primary"] {
+  background: var(--dg-navy); color: var(--dg-cream); border: none;
+}
+.stButton button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
+  background: #0d1320; color: #ffffff;
+}
+.stButton button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
+  background: transparent; color: var(--dg-navy2); border: 1px solid var(--dg-navy2);
+}
+
+/* Dividers, expanders, captions */
+hr { border-color: var(--dg-hair); }
+[data-testid="stExpander"] { border: 1px solid var(--dg-hair); border-radius: 12px; }
+[data-testid="stExpander"] summary:hover { color: var(--dg-navy); }
+[data-testid="stCaptionContainer"] { color: var(--dg-muted); }
+</style>
+"""
+st.markdown(DESIGN_CSS, unsafe_allow_html=True)
+
+
+def _render_brand_header():
+    """The DealGauge wordmark (light version on the paper background) + a short tagline.
+    Inline SVG so it renders crisply; falls back to a styled text wordmark if missing."""
+    logo = _asset_text("dealgauge-logo.svg")
+    if logo:
+        st.markdown(f'<div class="dg-header"><span class="dg-logo">{logo}</span></div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="dg-header"><h1 style="margin:0">DealGauge</h1></div>',
+                    unsafe_allow_html=True)
+    st.caption("Commercial real estate underwriting — enter a deal, get the metrics and a "
+               "buy/pass read.")
+
+
+# -----------------------------------------------------------------------------
+# Authentication + marketing landing page (Streamlit native OIDC).
+# Auth is configured in .streamlit/secrets.toml ([auth] with Google OIDC). No secret
+# ever lives in code. A signed-out visitor sees the full landing page below (the dark
+# "front door"); signing in with Google reveals the app. The app and engine are unchanged.
+#
+# DESIGN.md inverted for the landing: navy background, cream text, brass as the single
+# accent. The hero/section photos are downscaled web images in assets/web/, embedded as
+# base64 data URIs so the CSS gradient scrim + fade work cleanly (st.image can't do that).
+# -----------------------------------------------------------------------------
+GITHUB_URL = "https://github.com/your-org/dealgauge"   # placeholder — edit to the real repo
+SUPPORT_EMAIL = "nic.a.hornung@gmail.com"
+
+
+@st.cache_data(show_spinner=False)
+def _web_image_data_uri(filename):
+    """Base64 data URI for a downscaled web image in assets/web/ (encoded once, cached)."""
+    try:
+        raw = (ASSETS_DIR / "web" / filename).read_bytes()
+    except OSError:
+        return ""
+    return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+
+
+def _landing_css():
+    """The dark landing-page stylesheet, with the hero + Seattle + ending photos embedded."""
+    hero = _web_image_data_uri("hero.jpg")
+    seattle = _web_image_data_uri("seattle.jpg")
+    ending = _web_image_data_uri("ending.jpg")
+    return f"""
+<style>
+:root {{
+  --navy:#12182B; --navy2:#1A2238; --cream:#ECE6D6; --paperish:#FBFAF7;
+  --brass:#C2A35E; --muted:rgba(236,230,214,0.72); --hair:rgba(236,230,214,0.14);
+}}
+/* Full-bleed dark landing; hide the app chrome and remove container padding */
+.stApp {{ background: var(--navy); }}
+[data-testid="stHeader"] {{ display: none; }}
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {{ display: none; }}
+footer {{ display: none; }}
+[data-testid="stMainBlockContainer"], .block-container {{ max-width: 100% !important; padding: 0 !important; }}
+[data-testid="stMain"] {{ background: var(--navy); }}
+[data-testid="stVerticalBlock"] {{ gap: 0 !important; }}
+.stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3 {{
+  font-family: 'Inter','Segoe UI', system-ui, -apple-system, sans-serif;
+}}
+
+/* Section scaffold (8px rhythm, document-width inner wrap, generous whitespace) */
+.dg-wrap {{ max-width: 1080px; margin: 0 auto; }}
+.dg-sec {{ padding: 88px 28px; }}
+.dg-alt {{ background: #10152a; }}
+.dg-eyebrow {{ color: var(--brass); text-transform: uppercase; letter-spacing: 0.16em;
+  font-size: 0.76rem; font-weight: 700; margin: 0; }}
+/* Section headings: force bright white (!important beats Streamlit's themed heading
+   color, which otherwise renders these dark and they blend into the navy background) */
+.dg-h2 {{ color: #FFFFFF !important; font-size: clamp(1.6rem, 3vw, 2.15rem); font-weight: 700;
+  letter-spacing: -0.01em; margin: 10px 0 0; }}
+.dg-lead {{ color: var(--muted); font-size: 1.08rem; line-height: 1.6; margin: 16px 0 0; max-width: 640px; }}
+
+/* HERO over the Chicago photo: navy scrim for legibility + a fade into the page below */
+.dg-hero {{
+  position: relative; min-height: clamp(560px, 76vh, 780px);
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  padding: 80px 28px 64px;
+  background:
+    linear-gradient(180deg, rgba(18,24,43,0.60) 0%, rgba(18,24,43,0.54) 36%,
+                    rgba(18,24,43,0.84) 76%, var(--navy) 100%),
+    url("{hero}");
+  background-size: cover; background-position: center 26%;
+}}
+.dg-hero-inner {{ max-width: 920px; }}
+.dg-hero-logo svg {{ height: 56px; width: auto; margin-bottom: 30px; }}
+.dg-hero h1 {{ color: var(--paperish); font-size: clamp(2.1rem, 4.6vw, 3.4rem); line-height: 1.07;
+  font-weight: 700; letter-spacing: -0.025em; margin: 0 auto; max-width: 17ch; }}
+.dg-hero .sub {{ color: rgba(236,230,214,0.88); font-size: clamp(1.05rem, 1.7vw, 1.28rem);
+  line-height: 1.5; margin: 24px auto 0; max-width: 660px; }}
+
+/* CTA buttons (native st.button, keyed, centered via a 3-column row): brass on navy */
+.st-key-login_hero {{ margin-top: -18px; }}
+.st-key-login_final {{ margin-top: 14px; }}
+.st-key-login_hero button, .st-key-login_final button {{
+  background: var(--brass) !important; color: var(--navy) !important; border: none !important;
+  font-weight: 700; font-size: 1.04rem; padding: 0.8rem 2rem; border-radius: 11px;
+  max-width: 360px; margin: 0 auto; display: block;
+  box-shadow: 0 8px 22px rgba(0,0,0,0.30);
+}}
+.st-key-login_hero button:hover, .st-key-login_final button:hover {{
+  background: #cdb274 !important; color: var(--navy) !important;
+}}
+
+/* WHAT IT DOES — feature cards */
+.dg-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(232px, 1fr));
+  gap: 20px; margin-top: 38px; }}
+.dg-card {{ background: var(--navy2); border: 1px solid var(--hair); border-radius: 14px; padding: 26px 24px; }}
+.dg-card .dg-dot {{ width: 30px; height: 30px; border-radius: 8px;
+  background: rgba(194,163,94,0.16); border: 1px solid rgba(194,163,94,0.55); margin-bottom: 16px; }}
+.dg-card h3 {{ color: var(--cream); font-size: 1.06rem; font-weight: 600; margin: 0 0 8px; }}
+.dg-card p {{ color: var(--muted); font-size: 0.95rem; line-height: 1.55; margin: 0; }}
+
+/* HOW IT WORKS — numbered steps */
+.dg-steps {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; margin-top: 38px; }}
+.dg-step .dg-num {{ display: inline-flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; border-radius: 50%; border: 1.5px solid var(--brass);
+  color: var(--brass); font-weight: 700; font-size: 1.1rem; margin-bottom: 14px; }}
+.dg-step h3 {{ color: var(--cream); font-size: 1.05rem; font-weight: 600; margin: 0 0 6px; }}
+.dg-step p {{ color: var(--muted); font-size: 0.95rem; line-height: 1.5; margin: 0; }}
+
+/* WHO IT'S FOR — split with the businessmen accent image (tonal treatment) */
+.dg-split {{ display: grid; grid-template-columns: 1.05fr 1fr; gap: 46px; align-items: center; }}
+.dg-accent-frame {{ position: relative; border-radius: 16px; overflow: hidden; border: 1px solid var(--hair); }}
+.dg-accent-frame img {{ display: block; width: 100%; height: 100%; object-fit: cover;
+  filter: saturate(0.82) brightness(0.82) contrast(1.04); }}
+.dg-accent-frame::after {{ content: ""; position: absolute; inset: 0;
+  background: linear-gradient(180deg, rgba(18,24,43,0.08) 0%, rgba(18,24,43,0.44) 100%); }}
+
+/* DIFFERENTIATOR — band over the Seattle night photo */
+.dg-band {{
+  position: relative; padding: 108px 28px; text-align: center;
+  background:
+    linear-gradient(180deg, var(--navy) 0%, rgba(18,24,43,0.80) 24%,
+                    rgba(18,24,43,0.84) 76%, var(--navy) 100%),
+    url("{seattle}");
+  background-size: cover; background-position: center 42%;
+}}
+.dg-band .line {{ max-width: 880px; margin: 0 auto; color: var(--paperish);
+  font-size: clamp(1.3rem, 2.7vw, 1.95rem); line-height: 1.42; font-weight: 600; }}
+.dg-band .line b {{ color: var(--brass); font-weight: 700; }}
+
+/* FINAL CTA — centered in the navy gap between the Seattle band and the ending photo */
+.dg-final {{ text-align: center; padding: 96px 28px 26px; }}
+.dg-final .dg-h2, .dg-final .dg-lead {{ margin-left: auto; margin-right: auto; }}
+
+/* ENDING — the closing photo, faded right out, with the support email */
+.dg-end {{
+  position: relative; text-align: center; padding: 176px 28px 104px;
+  /* Hold navy under the button, then let the photo emerge gradually (no hard cut) and
+     stay softly visible toward the bottom where the email sits. */
+  background:
+    linear-gradient(180deg, var(--navy) 0%, var(--navy) 20%,
+                    rgba(18,24,43,0.85) 52%, rgba(18,24,43,0.70) 100%),
+    url("{ending}");
+  background-size: cover; background-position: center 55%;
+}}
+.dg-end-kicker {{ color: var(--brass); text-transform: uppercase; letter-spacing: 0.18em;
+  font-size: 0.72rem; font-weight: 700; margin: 0 0 14px; }}
+.dg-end-email {{ margin: 0; }}
+.dg-end-email a {{ color: var(--cream); text-decoration: none; font-size: 1.0rem;
+  letter-spacing: 0.03em; border-bottom: 1px solid rgba(194,163,94,0.55); padding-bottom: 3px; }}
+.dg-end-email a:hover {{ color: var(--brass); border-color: var(--brass); }}
+
+/* FOOTER */
+.dg-footer {{ border-top: 1px solid var(--hair); padding: 26px 28px 44px; }}
+.dg-foot-row {{ display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }}
+.dg-foot-brand {{ color: var(--cream); font-weight: 700; letter-spacing: 0.02em; }}
+.dg-foot-links a {{ color: var(--brass); text-decoration: none; margin-left: 22px; font-size: 0.92rem; }}
+.dg-foot-links a:hover {{ text-decoration: underline; }}
+.dg-foot-fine {{ color: rgba(236,230,214,0.5); font-size: 0.82rem; margin: 14px 0 0; }}
+
+@media (max-width: 760px) {{
+  .dg-sec {{ padding: 60px 22px; }}
+  .dg-split, .dg-steps {{ grid-template-columns: 1fr; }}
+  .dg-foot-row {{ flex-direction: column; align-items: flex-start; }}
+  .dg-foot-links a {{ margin: 0 22px 0 0; }}
+}}
+</style>
+"""
+
+
+def _login_cta(key):
+    """A centered brass 'Sign in with Google' button that starts the Google OIDC flow.
+    Centered with a 3-column row (reliable) and width-capped via CSS."""
+    middle = st.columns([1, 1, 1])[1]
+    if middle.button("Sign in with Google", key=key, type="primary", use_container_width=True):
+        st.login()   # uses the [auth] config in secrets.toml; redirects to Google
+
+
+def _render_landing():
+    """The signed-out marketing landing page (the dark front door). Sections render as
+    HTML; the two CTAs are native buttons so they can call st.login()."""
+    st.markdown(_landing_css(), unsafe_allow_html=True)
+    # Transparent wordmark (no navy plaque) so the logo floats cleanly over the photo.
+    logo = (_asset_text("dealgauge-logo-transparent.svg")
+            or _asset_text("dealgauge-logo-dark-cropped.svg")
+            or _asset_text("dealgauge-logo-dark.svg"))
+
+    # 1. HERO
+    st.markdown(f"""
+<section class="dg-hero"><div class="dg-hero-inner">
+  <div class="dg-hero-logo">{logo}</div>
+  <h1>Underwrite multifamily deals in minutes, not spreadsheets.</h1>
+  <p class="sub">DealGauge turns offering memos and rent rolls into institutional-grade
+  analysis, so you know whether a deal pencils before you ever build a model.</p>
+</div></section>
+""", unsafe_allow_html=True)
+    _login_cta("login_hero")
+
+    businessmen = _web_image_data_uri("businessmen.jpg")
+    # 2-5. WHAT IT DOES / HOW IT WORKS / WHO IT'S FOR / DIFFERENTIATOR + final-CTA heading
+    st.markdown(f"""
+<section class="dg-sec"><div class="dg-wrap">
+  <p class="dg-eyebrow">What it does</p>
+  <h2 class="dg-h2">Everything you need to call a deal.</h2>
+  <div class="dg-cards">
+    <div class="dg-card"><div class="dg-dot"></div>
+      <h3>Institutional-grade underwriting</h3>
+      <p>NOI, cap rate, DSCR, cash-on-cash, IRR, and a clear buy/pass verdict. Every
+      number traces back to your inputs.</p></div>
+    <div class="dg-card"><div class="dg-dot"></div>
+      <h3>AI document extraction</h3>
+      <p>Drop in an offering memorandum or rent roll and DealGauge reads it into a
+      populated model for you to review.</p></div>
+    <div class="dg-card"><div class="dg-dot"></div>
+      <h3>Value-add modeling</h3>
+      <p>Project renovations, rent ramps, and the forced appreciation that drives
+      multifamily returns.</p></div>
+    <div class="dg-card"><div class="dg-dot"></div>
+      <h3>One-click deal memos</h3>
+      <p>Export a clean, professional PDF you can share with partners or lenders.</p></div>
+  </div>
+</div></section>
+
+<section class="dg-sec dg-alt"><div class="dg-wrap">
+  <p class="dg-eyebrow">How it works</p>
+  <h2 class="dg-h2">Three steps to a defensible answer.</h2>
+  <div class="dg-steps">
+    <div class="dg-step"><span class="dg-num">1</span>
+      <h3>Enter or import a deal</h3>
+      <p>Type the numbers, or drop in an offering memo or rent roll.</p></div>
+    <div class="dg-step"><span class="dg-num">2</span>
+      <h3>Review the numbers and assumptions</h3>
+      <p>Every field is editable, so you stay in control of the model.</p></div>
+    <div class="dg-step"><span class="dg-num">3</span>
+      <h3>Get your verdict and memo</h3>
+      <p>A clear buy/pass read and an exportable PDF.</p></div>
+  </div>
+</div></section>
+
+<section class="dg-sec"><div class="dg-wrap dg-split">
+  <div class="dg-accent-frame"><img src="{businessmen}" alt="" /></div>
+  <div>
+    <p class="dg-eyebrow">Who it's for</p>
+    <h2 class="dg-h2">Built for people who move on deals.</h2>
+    <p class="dg-lead">Real estate investors, acquisition analysts, and anyone evaluating
+    multifamily deals who wants fast, defensible numbers without wrestling a spreadsheet.</p>
+  </div>
+</div></section>
+
+<section class="dg-band"><div class="dg-wrap">
+  <p class="line">AI reads your documents, but the math is <b>deterministic and
+  transparent</b>. Every result traces back to your inputs, <b>nothing is a black box</b>.</p>
+</div></section>
+
+<section class="dg-sec dg-final"><div class="dg-wrap">
+  <h2 class="dg-h2">See whether your next deal pencils.</h2>
+  <p class="dg-lead">Sign in with Google to start underwriting in minutes.</p>
+</div></section>
+""", unsafe_allow_html=True)
+    _login_cta("login_final")
+
+    # 6b. ENDING photo (faded) with the support email, then 7. FOOTER
+    st.markdown(f"""
+<section class="dg-end"><div class="dg-wrap">
+  <p class="dg-end-kicker">Get in touch</p>
+  <p class="dg-end-email"><a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a></p>
+</div></section>
+<footer class="dg-footer"><div class="dg-wrap">
+  <div class="dg-foot-row">
+    <span class="dg-foot-brand">DealGauge</span>
+    <span class="dg-foot-links">
+      <a href="{GITHUB_URL}" target="_blank" rel="noopener">GitHub</a>
+    </span>
+  </div>
+  <p class="dg-foot-fine">&copy; 2026 DealGauge &nbsp;&middot;&nbsp; DealGauge provides
+  analysis tools, not investment advice.</p>
+</div></footer>
+""", unsafe_allow_html=True)
+    st.stop()   # nothing below renders until the visitor is signed in
+
+
+def current_user_email():
+    """The signed-in user's email (the per-user deal owner), or None if unavailable."""
+    return getattr(st.user, "email", None)
 
 
 # -----------------------------------------------------------------------------
@@ -566,7 +997,7 @@ def _render_document_import():
     """The 'Import from documents (AI)' section: a file uploader plus an Extract button
     that makes ONE API call on press, then a review panel. Pre-fills happen via the
     _pending_extract flag (applied before the input widgets are created)."""
-    with st.expander("📄 Import from documents (AI)", expanded=False):
+    with st.expander("Import from documents (AI)", expanded=False):
         st.caption(
             "Upload a rent roll and/or operating statement (T-12) — PDF, image, CSV, or "
             "Excel — and Claude reads it into the rent-roll and expense inputs below. "
@@ -607,6 +1038,99 @@ def _render_document_import():
                 st.rerun()
 
         _render_extraction_review()
+
+
+# -----------------------------------------------------------------------------
+# Deal memo (Phase E)
+#
+# A one-page summary of a completed underwrite: the engine's numbers + verdict, plus a
+# plain-English write-up. The AI write-up is generated ONLY on the "Generate memo"
+# button press (one API call), never on rerun — and falls back to a template summary
+# with no API call when there's no key. The numbers shown and put in the PDF come
+# straight from the engine's results via deal_memo.build_memo_data; the AI only writes
+# the prose and never makes the buy/pass call.
+# -----------------------------------------------------------------------------
+def _memo_filename(memo_data):
+    """A tidy PDF filename from the deal name, e.g. deal-memo-maple-street.pdf."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", memo_data["property"]["name"]).strip("-").lower()
+    return f"deal-memo-{slug or 'deal'}.pdf"
+
+
+def _render_deal_memo(memo_data):
+    """Render the Deal memo section: a Generate button, the on-screen memo, and a PDF
+    download. Reads/writes st.session_state['_memo_narrative']; the API call happens only
+    on the button press."""
+    st.divider()
+    st.subheader("Deal memo")
+    st.caption("A one-page summary of this underwrite — the engine's numbers and verdict "
+               "with a plain-English write-up. Generate the write-up, then download the PDF.")
+
+    if st.button("Generate memo", key="memo_btn", use_container_width=True):
+        with st.spinner("Writing the memo…"):
+            st.session_state["_memo_narrative"] = deal_memo.generate_narrative(memo_data)
+        st.rerun()
+    st.caption("One **Generate memo** = one Claude API call (a fraction of a cent). Without "
+               "an API key it still produces a template summary — no call made.")
+
+    narrative = st.session_state.get("_memo_narrative")
+    if not narrative:
+        return
+
+    if narrative["source"] == "ai":
+        st.success("Write-up by Claude from the engine's numbers — it reports the model's "
+                   "verdict, it doesn't make it. Review before sharing.")
+    else:
+        st.info(narrative.get("error") or "Template summary (no AI used).")
+
+    # Compact on-screen rendering of the same memo (mirrors the PDF layout).
+    prop, met, asm = memo_data["property"], memo_data["metrics"], memo_data["assumptions"]
+    verdict = memo_data["verdict"]["verdict"]
+    with st.container(border=True):
+        st.markdown(f"#### {prop['name']}")
+        st.caption(f"{prop['property_type']} · {prop['number_of_units']} units · "
+                   f"{_money(prop['purchase_price'])} ({_money(prop['price_per_unit'])}/unit)")
+        st.markdown(f"**Model verdict: {verdict}** "
+                    f"({'clears every threshold' if verdict == 'BUY' else 'below one or more thresholds'})")
+
+        irr_text = f"{met['irr'] * 100:.1f}%" if met["irr"] is not None else "n/a"
+        em_text = f"{met['equity_multiple']:.2f}x" if met["equity_multiple"] is not None else "n/a"
+        st.markdown("**Key metrics**")
+        st.markdown(_markdown_table(
+            ["NOI", "Cap rate", "DSCR", "Cash-on-cash", "IRR", "Equity mult."],
+            [[_money(met["noi"]), f"{met['cap_rate'] * 100:.2f}%", f"{met['dscr']:.2f}x",
+              f"{met['cash_on_cash'] * 100:.2f}%", irr_text, em_text]],
+        ))
+
+        st.markdown("**Key assumptions**")
+        st.markdown(_markdown_table(
+            ["Vacancy", "Rate / amort", "Hold", "Rent gr.", "Exp. gr.", "Exit cap"],
+            [[f"{asm['vacancy_rate'] * 100:.1f}%",
+              f"{asm['interest_rate'] * 100:.2f}% / {asm['amortization_years']}y",
+              f"{asm['hold_period_years']}y", f"{asm['rent_growth'] * 100:.1f}%",
+              f"{asm['expense_growth'] * 100:.1f}%", f"{asm['exit_cap_rate'] * 100:.2f}%"]],
+        ))
+
+        if memo_data["value_add"]:
+            va = memo_data["value_add"]
+            st.markdown("**Value-add**")
+            st.markdown(_markdown_table(
+                ["Upside units", "NOI lift", "Value gain", "Reno cost", "Yrs to stab."],
+                [[str(va["num_upside_units"]), _money(va["noi_lift"]), _money(va["value_gain"]),
+                  _money(va["total_renovation_cost"]), str(va["years_to_stabilize"])]],
+            ))
+
+        st.markdown("**Summary**")
+        st.markdown(narrative["text"])
+
+    # PDF download — rendered locally from the same memo data (no API call).
+    try:
+        pdf_bytes = deal_memo.render_pdf(memo_data, narrative["text"])
+        st.download_button(
+            "Download PDF", data=pdf_bytes, file_name=_memo_filename(memo_data),
+            mime="application/pdf", use_container_width=True, key="memo_pdf_btn",
+        )
+    except Exception as exc:   # never let a render hiccup break the page
+        st.warning(f"Couldn't render the PDF ({exc}). The on-screen memo above is still complete.")
 
 
 # -----------------------------------------------------------------------------
@@ -796,10 +1320,28 @@ def _apply_deal_to_form(deal):
     st.session_state["sell_cost_pct"] = float(deal.get("selling_cost_pct", defaults["selling_cost_pct"])) * 100.0
 
 
-# A rent roll with this many units imports as larger_multifamily (5+) rather than the
-# default small_multifamily; only the expense TEMPLATE differs, the underwriting math is
-# identical across types.
-LARGER_MULTIFAMILY_MIN_UNITS = 5
+def _property_type_from_rent_roll(rent_roll, expenses):
+    """Derive the property type from the rent roll's unit-ROW count — exactly how the
+    types are defined. The row count is authoritative (use it, not any "number of units"
+    figure stated elsewhere in the document, in case they disagree):
+
+        1 unit  -> condo_townhome if the document shows HOA dues, else single_family_rental
+        2-4     -> small_multifamily
+        5+      -> larger_multifamily
+
+    Returns None when the count can't be determined (empty roll), so the caller leaves
+    the currently selected property type unchanged rather than guessing. Only the expense
+    TEMPLATE differs by type; the NOI / cap / DSCR / IRR math is identical across them."""
+    unit_count = len(rent_roll)
+    if unit_count <= 0:
+        return None
+    if unit_count == 1:
+        hoa = (expenses or {}).get("hoa")
+        has_hoa = hoa is not None and hoa > 0   # HOA dues in the doc -> a condo/townhome
+        return "condo_townhome" if has_hoa else "single_family_rental"
+    if unit_count <= 4:
+        return "small_multifamily"
+    return "larger_multifamily"
 
 
 def _apply_extraction_to_form(result):
@@ -813,14 +1355,16 @@ def _apply_extraction_to_form(result):
     - Offering price -> purchase price (the most important field; without it the rent roll
       gets underwritten against a stale price).
     - Stated vacancy rate -> vacancy input (only when the OM stated one; else left as is).
-    - Rent roll -> detailed Income mode + the unit table; 5+ units sets the property type
-      to larger multifamily (its expense template loads via the selectbox logic below).
+    - Rent roll -> detailed Income mode + the unit table, and the property type is derived
+      from the unit-row count (1 / 2-4 / 5+; a 1-unit doc with HOA dues -> condo), which
+      also loads that type's expense template. An empty roll leaves the type unchanged.
     - Expenses -> a single operating-expense TOTAL in Simple mode (a statement reports
       actual annual dollars; detailed mode would need %-of-price / %-of-income bases the
       statement doesn't give us).
     - Stated NOI is shown for cross-check only and is deliberately NOT applied.
     """
     summary = result.get("summary") or {}
+    expenses = result.get("operating_expenses") or {}
 
     if summary.get("offering_price") is not None:
         st.session_state["purchase_price"] = float(summary["offering_price"])
@@ -843,33 +1387,47 @@ def _apply_extraction_to_form(result):
         st.session_state.pop("rent_roll_editor", None)   # drop the editor's stale edits
         st.session_state["income_mode_label"] = "Detailed (rent roll)"
         st.session_state["number_of_units"] = max(len(rent_roll), 1)
-        # Property type by unit count: 5+ units -> larger multifamily. Leaving
-        # _applied_property_type unchanged lets the selectbox logic below load that
-        # type's expense template (and matching income default).
-        if len(rent_roll) >= LARGER_MULTIFAMILY_MIN_UNITS:
-            st.session_state["property_type"] = "larger_multifamily"
 
-    expenses = result.get("operating_expenses") or {}
+        # Derive the property type from the unit-row count (after the roll is parsed, so
+        # the count is known). Load that type's expense template directly and mark it
+        # applied, so the property-type selectbox below doesn't re-fire and reset the
+        # income mode we just set to detailed (single-family / condo default to simple).
+        derived_type = _property_type_from_rent_roll(rent_roll, expenses)
+        if derived_type is not None:
+            st.session_state["property_type"] = derived_type
+            _apply_expense_template(derived_type)
+            st.session_state["_applied_property_type"] = derived_type
+
     found = {key: value for key, value in expenses.items() if value is not None}
     if found:
         st.session_state["operating_expenses"] = float(sum(found.values()))
         st.session_state["expense_mode_label"] = "Simple (single total)"
 
 
+# Authentication gate: a signed-out visitor sees only the marketing landing page (which
+# calls st.stop()), so none of the app below renders until they're signed in with Google.
+if not st.user.is_logged_in:
+    _render_landing()
+
+# From here on the visitor is signed in. Their email owns the deals they save/load.
+USER_EMAIL = current_user_email()
+
 # Seed defaults first (only fills keys that don't exist yet).
 _seed_form_defaults()
 
 # Apply a pending load BEFORE any input widget is created this run. The "Load"
 # button (below) just records an id and reruns; we do the actual load here so we
-# never modify a widget's state after it has been instantiated.
+# never modify a widget's state after it has been instantiated. Scoped to the signed-in
+# user, so a deal id from another user (or a legacy deal) won't load.
 _pending_load_id = st.session_state.pop("_pending_load_id", None)
 if _pending_load_id is not None:
-    loaded_deal = database.load_deal(_pending_load_id)
+    loaded_deal = database.load_deal(_pending_load_id, owner=USER_EMAIL)
     if loaded_deal is not None:
         _apply_deal_to_form(loaded_deal)
         # Show the loaded deal's results immediately.
         st.session_state["_results_deal"] = loaded_deal
         st.session_state["_show_results"] = True
+        st.session_state.pop("_memo_narrative", None)   # a different deal -> stale memo
         st.session_state["_flash"] = f"Loaded “{loaded_deal['name']}” (deal #{_pending_load_id})."
 
 # Apply a pending RentCast pre-fill (set by an "Apply" button) BEFORE the input
@@ -892,8 +1450,7 @@ if _pending_extract is not None:
 # -----------------------------------------------------------------------------
 # Header + one-time flash message (e.g. "Saved", "Loaded")
 # -----------------------------------------------------------------------------
-st.title("🏢 CRE Underwriter")
-st.caption("Enter a small-multifamily deal, compute the metrics, and get a buy/pass read.")
+_render_brand_header()
 
 _flash = st.session_state.pop("_flash", None)
 if _flash:
@@ -904,8 +1461,15 @@ if _flash:
 # Sidebar: load a previously saved deal
 # -----------------------------------------------------------------------------
 with st.sidebar:
+    # Signed-in identity + log out, unobtrusively at the very top.
+    _display_name = (getattr(st.user, "name", None) or USER_EMAIL or "Signed in")
+    st.caption(f"Signed in as **{_display_name}**")
+    if st.button("Log out", key="logout_btn", use_container_width=True):
+        st.logout()
+    st.divider()
+
     st.header("Saved deals")
-    saved_deals = database.list_deals()  # via database.py — no direct SQL here
+    saved_deals = database.list_deals(owner=USER_EMAIL)  # only this user's deals
 
     if saved_deals:
         # Map a readable label -> deal id for the dropdown.
@@ -924,12 +1488,9 @@ with st.sidebar:
 
     st.divider()
     st.header("RentCast lookup")
-    # Live, non-secret diagnostic: does THIS running process see the key right now?
-    # Reads os.environ at render time and never prints the key itself.
-    if rentcast.has_api_key():
-        st.caption("🔑 API key: **detected**")
-    else:
-        st.caption("🔑 API key: **not detected** — set RENTCAST_API_KEY, then restart Streamlit.")
+    st.caption("Look up an address to pull an estimated property value and market rent, "
+               "each with a low–high range and nearby comparable sales and rentals — a "
+               "quick way to sanity-check your purchase price and rent assumptions.")
     lookup_address = st.text_input(
         "Property address", key="_rc_address",
         placeholder="Street, City, State, Zip",
@@ -947,12 +1508,12 @@ with st.sidebar:
             st.session_state["_rc_address_used"] = lookup_address.strip()
     st.caption("Estimates validate your inputs — they aren't final truth.")
 
-    with st.expander("Buy thresholds (from engine)"):
+    with st.expander("Buy thresholds"):
         thresholds = engine.DEFAULT_THRESHOLDS
         st.write(f"Cap rate ≥ {thresholds['min_cap_rate'] * 100:.2f}%")
         st.write(f"DSCR ≥ {thresholds['min_dscr']:.2f}x")
         st.write(f"Cash-on-cash ≥ {thresholds['min_cash_on_cash'] * 100:.2f}%")
-        st.caption("Edit these in engine.py (DEFAULT_THRESHOLDS).")
+        st.caption("A deal earns a BUY only if it clears all three.")
 
 
 # -----------------------------------------------------------------------------
@@ -994,170 +1555,173 @@ if st.session_state.get("_applied_property_type") != property_type:
 # Property inputs. The loan terms (interest rate, amortization) used to sit beside
 # these; they now live together with the rest of the loan in the Financing section
 # below, so the whole loan is described in one place.
-st.markdown("**Property**")
-prop_col1, prop_col2 = st.columns(2)
-purchase_price = prop_col1.number_input(
-    "Purchase price ($)", key="purchase_price",
-    min_value=0.0, step=5000.0, format="%.0f",
-    help="The price you pay for the property.",
-)
-vacancy_pct = prop_col2.number_input(
-    "Vacancy rate (%)", key="vacancy_pct",
-    min_value=0.0, max_value=100.0, step=0.5, format="%.2f",
-    help="Expected ongoing vacancy assumption — separate from any units currently "
-         "marked vacant in the rent roll.",
-)
+with st.container(border=True):
+    st.markdown('<p class="dg-card-title">Property</p>', unsafe_allow_html=True)
+    prop_col1, prop_col2 = st.columns(2)
+    purchase_price = prop_col1.number_input(
+        "Purchase price ($)", key="purchase_price",
+        min_value=0.0, step=5000.0, format="%.0f",
+        help="The price you pay for the property.",
+    )
+    vacancy_pct = prop_col2.number_input(
+        "Vacancy rate (%)", key="vacancy_pct",
+        min_value=0.0, max_value=100.0, step=0.5, format="%.2f",
+        help="Expected ongoing vacancy assumption — separate from any units currently "
+             "marked vacant in the rent roll.",
+    )
 
 # -----------------------------------------------------------------------------
 # Income (Phase A): a single gross total, or a detailed per-unit rent roll.
 # -----------------------------------------------------------------------------
-st.markdown("**Income**")
-income_mode_label = st.radio(
-    "Income input mode", ["Detailed (rent roll)", "Simple (single total)"],
-    key="income_mode_label", horizontal=True, label_visibility="collapsed",
-    help="Rent roll sums per-unit rents (a vacant unit counts as $0); Simple takes one "
-         "annual gross number. Defaults to rent roll for multifamily.",
-)
-income_detailed = income_mode_label.startswith("Detailed")
-
-if income_detailed:
-    st.caption("Add or remove unit rows. A vacant unit stays listed but contributes $0 "
-               "to current income. Set a unit's **market rent** above its current rent to "
-               "model renovation upside.")
-    roll_df = pd.DataFrame(st.session_state["rent_roll"], columns=RENT_ROLL_COLUMNS)
-    edited_roll = st.data_editor(
-        roll_df, key="rent_roll_editor", num_rows="dynamic", hide_index=True,
-        use_container_width=True,
-        column_config={
-            "label": st.column_config.TextColumn("Unit"),
-            "unit_type": st.column_config.TextColumn("Type (bd/ba)"),
-            "square_footage": st.column_config.NumberColumn("SqFt", min_value=0, step=10),
-            "monthly_rent": st.column_config.NumberColumn("Rent/mo", min_value=0, step=25, format="$%d"),
-            "market_rent": st.column_config.NumberColumn(
-                "Market rent/mo", min_value=0, step=25, format="$%d",
-                help="Achievable rent after renovation; leave blank if already at market."),
-            "occupied": st.column_config.CheckboxColumn("Occupied"),
-        },
+with st.container(border=True):
+    st.markdown('<p class="dg-card-title">Income</p>', unsafe_allow_html=True)
+    income_mode_label = st.radio(
+        "Income input mode", ["Detailed (rent roll)", "Simple (single total)"],
+        key="income_mode_label", horizontal=True, label_visibility="collapsed",
+        help="Rent roll sums per-unit rents (a vacant unit counts as $0); Simple takes one "
+             "annual gross number. Defaults to rent roll for multifamily.",
     )
-    rent_roll = _clean_rent_roll(edited_roll)
-    roll_summary = engine.summarize_rent_roll(rent_roll)
-    gross_rental_income = roll_summary["annual_gross_rental_income"]
-    number_of_units = roll_summary["unit_count"]
-    # Reconcile: in detailed mode the rent roll defines the unit count (used by per-unit
-    # reserves), so derive number_of_units from it rather than a separate field.
-    st.session_state["number_of_units"] = max(number_of_units, 1)
+    income_detailed = income_mode_label.startswith("Detailed")
 
-    # Split across two rows so the dollar figures get enough width to show in full
-    # (a single 5-column row truncated "Annual gross" to "$102,...").
-    count_totals = st.columns(3)
-    count_totals[0].metric("Units", roll_summary["unit_count"])
-    count_totals[1].metric("Occupied", f"{roll_summary['occupied_count']}/{roll_summary['unit_count']}")
-    count_totals[2].metric("Occupancy", f"{roll_summary['physical_occupancy'] * 100:.0f}%")
-    rent_totals = st.columns(2)
-    rent_totals[0].metric("Monthly rent (occupied)", _money(roll_summary["occupied_monthly_rent"]))
-    rent_totals[1].metric("Annual gross", _money(gross_rental_income))
-
-    st.markdown("**Value-add** (renovate units toward market rent)")
-    va_col1, va_col2 = st.columns(2)
-    renovation_cost_per_unit = va_col1.number_input(
-        "Renovation cost ($/unit)", key="renovation_cost_per_unit_input",
-        min_value=0.0, step=1000.0, format="%.0f",
-        help="Capex per unit to renovate it to market rent.",
-    )
-    renovation_pace = va_col2.number_input(
-        "Renovation pace (units/yr)", key="renovation_pace_input",
-        min_value=0.0, max_value=100.0, step=1.0, format="%.1f",
-        help="Units renovated per year, e.g. as leases turn. 0 = no renovation plan.",
-    )
-
-    # Warn when an occupied unit's current rent is already at/above its market rent (a
-    # market rent IS set, but there's no upside to capture) — otherwise the flat pro
-    # forma looks like a bug. Blank/zero market rent = no upside modeled, so no warning.
-    no_upside_units = [
-        unit for unit in rent_roll
-        if unit.get("occupied", True)
-        and unit.get("market_rent")  # market rent set and non-zero
-        and (unit.get("monthly_rent") or 0.0) >= unit["market_rent"]
-    ]
-    if no_upside_units:
-        shown = ", ".join(str(unit.get("label") or "?") for unit in no_upside_units[:6])
-        more = f" and {len(no_upside_units) - 6} more" if len(no_upside_units) > 6 else ""
-        st.warning(
-            f"⚠️ {len(no_upside_units)} occupied unit(s) ({shown}{more}) have a current rent "
-            "**at or above** their market rent, so there's no renovation upside to capture — "
-            "the value-add ramp won't do anything for them. Double-check that the current and "
-            "market rents were entered correctly."
+    if income_detailed:
+        st.caption("Add or remove unit rows. A vacant unit stays listed but contributes $0 "
+                   "to current income. Set a unit's **market rent** above its current rent to "
+                   "model renovation upside.")
+        roll_df = pd.DataFrame(st.session_state["rent_roll"], columns=RENT_ROLL_COLUMNS)
+        edited_roll = st.data_editor(
+            roll_df, key="rent_roll_editor", num_rows="dynamic", hide_index=True,
+            use_container_width=True,
+            column_config={
+                "label": st.column_config.TextColumn("Unit"),
+                "unit_type": st.column_config.TextColumn("Type (bd/ba)"),
+                "square_footage": st.column_config.NumberColumn("SqFt", min_value=0, step=10),
+                "monthly_rent": st.column_config.NumberColumn("Rent/mo", min_value=0, step=25, format="$%d"),
+                "market_rent": st.column_config.NumberColumn(
+                    "Market rent/mo", min_value=0, step=25, format="$%d",
+                    help="Achievable rent after renovation; leave blank if already at market."),
+                "occupied": st.column_config.CheckboxColumn("Occupied"),
+            },
         )
-else:
-    income_col1, income_col2 = st.columns(2)
-    gross_rental_income = income_col1.number_input(
-        "Gross rental income ($/yr)", key="gross_rental_income",
-        min_value=0.0, step=1000.0, format="%.0f",
-        help="Total annual rent if every unit is occupied.",
-    )
-    number_of_units = income_col2.number_input(
-        "Number of units", key="number_of_units",
-        min_value=1, max_value=50, step=1,
-        help="Unit count — used for per-unit replacement reserves.",
-    )
-    rent_roll = None
-    # Value-add needs a rent roll; in simple mode carry the stored values (unused).
-    renovation_cost_per_unit = st.session_state.get("renovation_cost_per_unit_input", 0.0)
-    renovation_pace = st.session_state.get("renovation_pace_input", 0.0)
+        rent_roll = _clean_rent_roll(edited_roll)
+        roll_summary = engine.summarize_rent_roll(rent_roll)
+        gross_rental_income = roll_summary["annual_gross_rental_income"]
+        number_of_units = roll_summary["unit_count"]
+        # Reconcile: in detailed mode the rent roll defines the unit count (used by per-unit
+        # reserves), so derive number_of_units from it rather than a separate field.
+        st.session_state["number_of_units"] = max(number_of_units, 1)
 
-st.markdown("**Operating expenses**")
-expense_mode_label = st.radio(
-    "Expense input mode", ["Detailed (line items)", "Simple (single total)"],
-    key="expense_mode_label", horizontal=True, label_visibility="collapsed",
-    help="Detailed builds the total from standard line items; Simple takes one number "
-         "so a quick look doesn't need six fields.",
-)
-expense_detailed = expense_mode_label.startswith("Detailed")
+        # Split across two rows so the dollar figures get enough width to show in full
+        # (a single 5-column row truncated "Annual gross" to "$102,...").
+        count_totals = st.columns(3)
+        count_totals[0].metric("Units", roll_summary["unit_count"])
+        count_totals[1].metric("Occupied", f"{roll_summary['occupied_count']}/{roll_summary['unit_count']}")
+        count_totals[2].metric("Occupancy", f"{roll_summary['physical_occupancy'] * 100:.0f}%")
+        rent_totals = st.columns(2)
+        rent_totals[0].metric("Monthly rent (occupied)", _money(roll_summary["occupied_monthly_rent"]))
+        rent_totals[1].metric("Annual gross", _money(gross_rental_income))
 
-if expense_detailed:
-    ecol1, ecol2, ecol3 = st.columns(3)
-    ecol1.number_input(
-        "Property taxes (% of price)", key="property_tax_pct",
-        min_value=0.0, max_value=10.0, step=0.05, format="%.2f",
+        st.markdown("**Value-add** (renovate units toward market rent)")
+        va_col1, va_col2 = st.columns(2)
+        renovation_cost_per_unit = va_col1.number_input(
+            "Renovation cost ($/unit)", key="renovation_cost_per_unit_input",
+            min_value=0.0, step=1000.0, format="%.0f",
+            help="Capex per unit to renovate it to market rent.",
+        )
+        renovation_pace = va_col2.number_input(
+            "Renovation pace (units/yr)", key="renovation_pace_input",
+            min_value=0.0, max_value=100.0, step=1.0, format="%.1f",
+            help="Units renovated per year, e.g. as leases turn. 0 = no renovation plan.",
+        )
+
+        # Warn when an occupied unit's current rent is already at/above its market rent (a
+        # market rent IS set, but there's no upside to capture) — otherwise the flat pro
+        # forma looks like a bug. Blank/zero market rent = no upside modeled, so no warning.
+        no_upside_units = [
+            unit for unit in rent_roll
+            if unit.get("occupied", True)
+            and unit.get("market_rent")  # market rent set and non-zero
+            and (unit.get("monthly_rent") or 0.0) >= unit["market_rent"]
+        ]
+        if no_upside_units:
+            shown = ", ".join(str(unit.get("label") or "?") for unit in no_upside_units[:6])
+            more = f" and {len(no_upside_units) - 6} more" if len(no_upside_units) > 6 else ""
+            st.warning(
+                f"⚠️ {len(no_upside_units)} occupied unit(s) ({shown}{more}) have a current rent "
+                "**at or above** their market rent, so there's no renovation upside to capture — "
+                "the value-add ramp won't do anything for them. Double-check that the current and "
+                "market rents were entered correctly."
+            )
+    else:
+        income_col1, income_col2 = st.columns(2)
+        gross_rental_income = income_col1.number_input(
+            "Gross rental income ($/yr)", key="gross_rental_income",
+            min_value=0.0, step=1000.0, format="%.0f",
+            help="Total annual rent if every unit is occupied.",
+        )
+        number_of_units = income_col2.number_input(
+            "Number of units", key="number_of_units",
+            min_value=1, max_value=50, step=1,
+            help="Unit count — used for per-unit replacement reserves.",
+        )
+        rent_roll = None
+        # Value-add needs a rent roll; in simple mode carry the stored values (unused).
+        renovation_cost_per_unit = st.session_state.get("renovation_cost_per_unit_input", 0.0)
+        renovation_pace = st.session_state.get("renovation_pace_input", 0.0)
+
+with st.container(border=True):
+    st.markdown('<p class="dg-card-title">Operating expenses</p>', unsafe_allow_html=True)
+    expense_mode_label = st.radio(
+        "Expense input mode", ["Detailed (line items)", "Simple (single total)"],
+        key="expense_mode_label", horizontal=True, label_visibility="collapsed",
+        help="Detailed builds the total from standard line items; Simple takes one number "
+             "so a quick look doesn't need six fields.",
     )
-    ecol2.number_input(
-        "Management (% of income)", key="management_pct_ui",
-        min_value=0.0, max_value=30.0, step=0.5, format="%.1f",
-    )
-    ecol3.number_input(
-        "Repairs (% of income)", key="repairs_pct_ui",
-        min_value=0.0, max_value=30.0, step=0.5, format="%.1f",
-    )
-    ecol4, ecol5, ecol6 = st.columns(3)
-    ecol4.number_input(
-        "Insurance ($/yr)", key="insurance_annual",
-        min_value=0.0, step=250.0, format="%.0f",
-    )
-    ecol5.number_input(
-        "Utilities, owner-paid ($/yr)", key="utilities_annual",
-        min_value=0.0, step=250.0, format="%.0f",
-    )
-    ecol6.number_input(
-        "Reserves ($/unit/yr)", key="reserves_per_unit",
-        min_value=0.0, step=50.0, format="%.0f",
-        help="Multiplied by the number of units above.",
-    )
-    if property_type == "condo_townhome":
+    expense_detailed = expense_mode_label.startswith("Detailed")
+
+    if expense_detailed:
+        ecol1, ecol2, ecol3 = st.columns(3)
+        ecol1.number_input(
+            "Property taxes (% of price)", key="property_tax_pct",
+            min_value=0.0, max_value=10.0, step=0.05, format="%.2f",
+        )
+        ecol2.number_input(
+            "Management (% of income)", key="management_pct_ui",
+            min_value=0.0, max_value=30.0, step=0.5, format="%.1f",
+        )
+        ecol3.number_input(
+            "Repairs (% of income)", key="repairs_pct_ui",
+            min_value=0.0, max_value=30.0, step=0.5, format="%.1f",
+        )
+        ecol4, ecol5, ecol6 = st.columns(3)
+        ecol4.number_input(
+            "Insurance ($/yr)", key="insurance_annual",
+            min_value=0.0, step=250.0, format="%.0f",
+        )
+        ecol5.number_input(
+            "Utilities, owner-paid ($/yr)", key="utilities_annual",
+            min_value=0.0, step=250.0, format="%.0f",
+        )
+        ecol6.number_input(
+            "Reserves ($/unit/yr)", key="reserves_per_unit",
+            min_value=0.0, step=50.0, format="%.0f",
+            help="Multiplied by the number of units above.",
+        )
+        if property_type == "condo_townhome":
+            st.number_input(
+                "HOA fees ($/yr)", key="hoa_annual",
+                min_value=0.0, step=300.0, format="%.0f",
+                help="Condo/townhome HOA dues — the major line item for this type.",
+            )
+            st.caption("Condo defaults assume the HOA covers the structure, so owner-paid "
+                       "**insurance and maintenance are intentionally low** to avoid double-counting "
+                       "(the HOA fee already includes master insurance and exterior upkeep).")
+        st.caption("The total operating expenses and the expense ratio appear in the results below.")
+    else:
         st.number_input(
-            "HOA fees ($/yr)", key="hoa_annual",
-            min_value=0.0, step=300.0, format="%.0f",
-            help="Condo/townhome HOA dues — the major line item for this type.",
+            "Operating expenses, total ($/yr)", key="operating_expenses",
+            min_value=0.0, step=1000.0, format="%.0f",
+            help="A single all-in operating-expense number for a quick look.",
         )
-        st.caption("Condo defaults assume the HOA covers the structure, so owner-paid "
-                   "**insurance and maintenance are intentionally low** to avoid double-counting "
-                   "(the HOA fee already includes master insurance and exterior upkeep).")
-    st.caption("The total operating expenses and the expense ratio appear in the results below.")
-else:
-    st.number_input(
-        "Operating expenses, total ($/yr)", key="operating_expenses",
-        min_value=0.0, step=1000.0, format="%.0f",
-        help="A single all-in operating-expense number for a quick look.",
-    )
 
 # Assemble the deal so far (income + expenses). Financing (loan terms + amount) and
 # the hold & exit assumptions are added below. NOI must be known before the loan can
@@ -1200,137 +1764,139 @@ noi_now = engine.calculate_noi(
 # limits to size it from. (Interest rate and amortization used to sit in a separate
 # "Loan terms" box by Property; they're consolidated here.)
 # -----------------------------------------------------------------------------
-st.markdown("**Financing**")
-financing_mode_label = st.radio(
-    "Financing mode",
-    ["Manual (enter loan / down payment)", "Size the loan (commercial)"],
-    key="financing_mode_label", horizontal=True, label_visibility="collapsed",
-    help="Manual: type the loan and down payment. Sized: the loan is the smaller of "
-         "the max-LTV and min-DSCR limits, using this deal's NOI.",
-)
-financing_sized = financing_mode_label.startswith("Size")
-
-# Loan terms apply to both modes (and the sizing below needs them), so they come first.
-rate_col, amort_col = st.columns(2)
-interest_pct = rate_col.number_input(
-    "Interest rate (%)", key="interest_pct",
-    min_value=0.0, max_value=30.0, step=0.125, format="%.3f",
-    help="Annual fixed mortgage rate.",
-)
-amortization_years = amort_col.number_input(
-    "Amortization (years)", key="amortization_years",
-    min_value=1, max_value=40, step=1,
-    help="Years to fully pay the loan off.",
-)
-current_deal["annual_interest_rate"] = interest_pct / 100.0
-current_deal["amortization_years"] = int(amortization_years)
-
-if financing_sized:
-    fin_col1, fin_col2 = st.columns(2)
-    ltv_max = fin_col1.number_input(
-        "Max LTV (%)", key="ltv_max_pct",
-        min_value=1.0, max_value=100.0, step=1.0, format="%.1f",
-        help="Loan can't exceed this share of the purchase price.",
-    ) / 100.0
-    dscr_min = fin_col2.number_input(
-        "Min DSCR (x)", key="dscr_min_input",
-        min_value=1.0, max_value=2.0, step=0.05, format="%.2f",
-        help="NOI must cover annual debt service at least this many times.",
+with st.container(border=True):
+    st.markdown('<p class="dg-card-title">Financing</p>', unsafe_allow_html=True)
+    financing_mode_label = st.radio(
+        "Financing mode",
+        ["Manual (enter loan / down payment)", "Size the loan (commercial)"],
+        key="financing_mode_label", horizontal=True, label_visibility="collapsed",
+        help="Manual: type the loan and down payment. Sized: the loan is the smaller of "
+             "the max-LTV and min-DSCR limits, using this deal's NOI.",
     )
-    sizing = engine.size_loan(
-        purchase_price, noi_now, current_deal["annual_interest_rate"],
-        current_deal["amortization_years"], ltv_max, dscr_min,
-    )
-    loan_amount = sizing["sized_loan"]
-    down_payment = sizing["down_payment"]
-    st.caption(f"NOI used for sizing: **{_money(noi_now)}**  ·  binding constraint: "
-               f"**{sizing['binding_constraint']}** (the loan is the smaller of the two limits).")
-    size_cols = st.columns(4)
-    size_cols[0].metric("LTV-constrained loan", _money(sizing["ltv_loan"]))
-    size_cols[1].metric("DSCR-constrained loan", _money(sizing["dscr_loan"]))
-    size_cols[2].metric("Sized loan", _money(sizing["sized_loan"]))
-    size_cols[3].metric("Down payment", _money(sizing["down_payment"]))
-    result_cols = st.columns(2)
-    result_cols[0].metric(
-        "Resulting DSCR",
-        f"{sizing['resulting_dscr']:.2f}x" if sizing["resulting_dscr"] is not None else "n/a",
-    )
-    result_cols[1].metric("Resulting LTV", f"{sizing['resulting_ltv'] * 100:.1f}%")
-else:
-    fin_col1, fin_col2 = st.columns(2)
-    loan_amount = fin_col1.number_input(
-        "Loan amount ($)", key="loan_amount",
-        min_value=0.0, step=5000.0, format="%.0f",
-        help="Amount borrowed (principal).",
-    )
-    down_payment = fin_col2.number_input(
-        "Down payment ($)", key="down_payment",
-        min_value=0.0, step=5000.0, format="%.0f",
-        help="Your out-of-pocket cash going in.",
-    )
-    ltv_max = st.session_state.get("ltv_max_pct", 75.0) / 100.0
-    dscr_min = st.session_state.get("dscr_min_input", 1.25)
+    financing_sized = financing_mode_label.startswith("Size")
 
-current_deal["financing_mode"] = "sized" if financing_sized else "manual"
-current_deal["loan_amount"] = loan_amount
-current_deal["down_payment"] = down_payment
-current_deal["ltv_max"] = ltv_max
-current_deal["dscr_min"] = dscr_min
+    # Loan terms apply to both modes (and the sizing below needs them), so they come first.
+    rate_col, amort_col = st.columns(2)
+    interest_pct = rate_col.number_input(
+        "Interest rate (%)", key="interest_pct",
+        min_value=0.0, max_value=30.0, step=0.125, format="%.3f",
+        help="Annual fixed mortgage rate.",
+    )
+    amortization_years = amort_col.number_input(
+        "Amortization (years)", key="amortization_years",
+        min_value=1, max_value=40, step=1,
+        help="Years to fully pay the loan off.",
+    )
+    current_deal["annual_interest_rate"] = interest_pct / 100.0
+    current_deal["amortization_years"] = int(amortization_years)
 
-st.markdown("**Hold & exit assumptions**")
-hold_col, rentg_col, expg_col, exitcap_col, sellcost_col = st.columns(5)
-hold_period_years = hold_col.number_input(
-    "Hold (yrs)", key="hold_period_years",
-    min_value=1, max_value=40, step=1,
-    help="How many years you plan to own before selling.",
-)
-rent_growth_pct = rentg_col.number_input(
-    "Rent growth (%/yr)", key="rent_growth_pct",
-    min_value=-20.0, max_value=20.0, step=0.25, format="%.2f",
-    help="Annual growth in gross rent.",
-)
-expense_growth_pct = expg_col.number_input(
-    "Expense growth (%/yr)", key="expense_growth_pct",
-    min_value=-20.0, max_value=20.0, step=0.25, format="%.2f",
-    help="Annual growth in operating expenses.",
-)
-exit_cap_pct = exitcap_col.number_input(
-    "Exit cap rate (%)", key="exit_cap_pct",
-    min_value=0.10, max_value=30.0, step=0.10, format="%.2f",
-    help="Cap rate a buyer pays at sale: sale price = final-year NOI / exit cap rate.",
-)
-sell_cost_pct = sellcost_col.number_input(
-    "Selling costs (%)", key="sell_cost_pct",
-    min_value=0.0, max_value=20.0, step=0.5, format="%.2f",
-    help="Broker + closing costs at sale, as a % of the sale price.",
-)
+    if financing_sized:
+        fin_col1, fin_col2 = st.columns(2)
+        ltv_max = fin_col1.number_input(
+            "Max LTV (%)", key="ltv_max_pct",
+            min_value=1.0, max_value=100.0, step=1.0, format="%.1f",
+            help="Loan can't exceed this share of the purchase price.",
+        ) / 100.0
+        dscr_min = fin_col2.number_input(
+            "Min DSCR (x)", key="dscr_min_input",
+            min_value=1.0, max_value=2.0, step=0.05, format="%.2f",
+            help="NOI must cover annual debt service at least this many times.",
+        )
+        sizing = engine.size_loan(
+            purchase_price, noi_now, current_deal["annual_interest_rate"],
+            current_deal["amortization_years"], ltv_max, dscr_min,
+        )
+        loan_amount = sizing["sized_loan"]
+        down_payment = sizing["down_payment"]
+        st.caption(f"NOI used for sizing: **{_money(noi_now)}**  ·  binding constraint: "
+                   f"**{sizing['binding_constraint']}** (the loan is the smaller of the two limits).")
+        size_cols = st.columns(4)
+        size_cols[0].metric("LTV-constrained loan", _money(sizing["ltv_loan"]))
+        size_cols[1].metric("DSCR-constrained loan", _money(sizing["dscr_loan"]))
+        size_cols[2].metric("Sized loan", _money(sizing["sized_loan"]))
+        size_cols[3].metric("Down payment", _money(sizing["down_payment"]))
+        result_cols = st.columns(2)
+        result_cols[0].metric(
+            "Resulting DSCR",
+            f"{sizing['resulting_dscr']:.2f}x" if sizing["resulting_dscr"] is not None else "n/a",
+        )
+        result_cols[1].metric("Resulting LTV", f"{sizing['resulting_ltv'] * 100:.1f}%")
+    else:
+        fin_col1, fin_col2 = st.columns(2)
+        loan_amount = fin_col1.number_input(
+            "Loan amount ($)", key="loan_amount",
+            min_value=0.0, step=5000.0, format="%.0f",
+            help="Amount borrowed (principal).",
+        )
+        down_payment = fin_col2.number_input(
+            "Down payment ($)", key="down_payment",
+            min_value=0.0, step=5000.0, format="%.0f",
+            help="Your out-of-pocket cash going in.",
+        )
+        ltv_max = st.session_state.get("ltv_max_pct", 75.0) / 100.0
+        dscr_min = st.session_state.get("dscr_min_input", 1.25)
 
-# Add the hold & exit assumptions to the deal (Phase 7-8): percent inputs -> fractions.
-current_deal["hold_period_years"] = int(hold_period_years)
-current_deal["rent_growth"] = rent_growth_pct / 100.0
-current_deal["expense_growth"] = expense_growth_pct / 100.0
-current_deal["exit_cap_rate"] = exit_cap_pct / 100.0
-current_deal["selling_cost_pct"] = sell_cost_pct / 100.0
+    current_deal["financing_mode"] = "sized" if financing_sized else "manual"
+    current_deal["loan_amount"] = loan_amount
+    current_deal["down_payment"] = down_payment
+    current_deal["ltv_max"] = ltv_max
+    current_deal["dscr_min"] = dscr_min
 
-# Market trends (Phase 11): OPT-IN, a single extra API call, cached by zip. Placed
-# next to the rent-growth input so real history sits beside the user's assumption.
-with st.expander("📈 Market trends from RentCast (uses 1 API call)"):
-    st.caption("Optional: compare your rent-growth assumption to the zip's recent "
-               "history. Separate from the address lookup, cached per zip, never automatic.")
-    st.session_state.setdefault("_trend_zip", _zip_from_address(st.session_state.get("_rc_address", "")))
-    zip_col, btn_col = st.columns([2, 1])
-    trend_zip = zip_col.text_input("Zip code", key="_trend_zip", max_chars=5,
-                                   placeholder="5-digit zip")
-    fetch_trends = btn_col.button("Get market trends", key="trends_btn", use_container_width=True)
-    if fetch_trends:
-        cleaned_zip = (trend_zip or "").strip()
-        if not (cleaned_zip.isdigit() and len(cleaned_zip) == 5):
-            st.warning("Enter a 5-digit zip code.")
-        else:
-            with st.spinner("Asking RentCast for market history…"):
-                st.session_state["_trends"] = market_trends(cleaned_zip)  # 1 call, cached by zip
-            st.session_state["_trends_zip"] = cleaned_zip
-    _render_market_trends()
+with st.container(border=True):
+    st.markdown('<p class="dg-card-title">Hold &amp; exit assumptions</p>', unsafe_allow_html=True)
+    hold_col, rentg_col, expg_col, exitcap_col, sellcost_col = st.columns(5)
+    hold_period_years = hold_col.number_input(
+        "Hold (yrs)", key="hold_period_years",
+        min_value=1, max_value=40, step=1,
+        help="How many years you plan to own before selling.",
+    )
+    rent_growth_pct = rentg_col.number_input(
+        "Rent growth (%/yr)", key="rent_growth_pct",
+        min_value=-20.0, max_value=20.0, step=0.25, format="%.2f",
+        help="Annual growth in gross rent.",
+    )
+    expense_growth_pct = expg_col.number_input(
+        "Expense growth (%/yr)", key="expense_growth_pct",
+        min_value=-20.0, max_value=20.0, step=0.25, format="%.2f",
+        help="Annual growth in operating expenses.",
+    )
+    exit_cap_pct = exitcap_col.number_input(
+        "Exit cap rate (%)", key="exit_cap_pct",
+        min_value=0.10, max_value=30.0, step=0.10, format="%.2f",
+        help="Cap rate a buyer pays at sale: sale price = final-year NOI / exit cap rate.",
+    )
+    sell_cost_pct = sellcost_col.number_input(
+        "Selling costs (%)", key="sell_cost_pct",
+        min_value=0.0, max_value=20.0, step=0.5, format="%.2f",
+        help="Broker + closing costs at sale, as a % of the sale price.",
+    )
+
+    # Add the hold & exit assumptions to the deal (Phase 7-8): percent inputs -> fractions.
+    current_deal["hold_period_years"] = int(hold_period_years)
+    current_deal["rent_growth"] = rent_growth_pct / 100.0
+    current_deal["expense_growth"] = expense_growth_pct / 100.0
+    current_deal["exit_cap_rate"] = exit_cap_pct / 100.0
+    current_deal["selling_cost_pct"] = sell_cost_pct / 100.0
+
+    # Market trends (Phase 11): OPT-IN, a single extra API call, cached by zip. Placed
+    # next to the rent-growth input so real history sits beside the user's assumption.
+    with st.expander("Market trends from RentCast (uses 1 API call)"):
+        st.caption("Optional: compare your rent-growth assumption to the zip's recent "
+                   "history. Separate from the address lookup, cached per zip, never automatic.")
+        st.session_state.setdefault("_trend_zip", _zip_from_address(st.session_state.get("_rc_address", "")))
+        zip_col, btn_col = st.columns([2, 1])
+        trend_zip = zip_col.text_input("Zip code", key="_trend_zip", max_chars=5,
+                                       placeholder="5-digit zip")
+        fetch_trends = btn_col.button("Get market trends", key="trends_btn", use_container_width=True)
+        if fetch_trends:
+            cleaned_zip = (trend_zip or "").strip()
+            if not (cleaned_zip.isdigit() and len(cleaned_zip) == 5):
+                st.warning("Enter a 5-digit zip code.")
+            else:
+                with st.spinner("Asking RentCast for market history…"):
+                    st.session_state["_trends"] = market_trends(cleaned_zip)  # 1 call, cached by zip
+                st.session_state["_trends_zip"] = cleaned_zip
+        _render_market_trends()
 
 
 # -----------------------------------------------------------------------------
@@ -1346,12 +1912,13 @@ if run_clicked:
     # Snapshot the inputs so the results stay put until the next run.
     st.session_state["_results_deal"] = current_deal
     st.session_state["_show_results"] = True
+    st.session_state.pop("_memo_narrative", None)   # new underwrite -> any prior memo is stale
 
 if save_clicked:
     if not current_deal["name"].strip():
         st.error("Give the deal a name before saving.")
     else:
-        new_id = database.save_deal(current_deal)  # via database.py — no direct SQL
+        new_id = database.save_deal(current_deal, owner=USER_EMAIL)  # tagged to this user
         st.session_state["_flash"] = f"Saved “{current_deal['name']}” as deal #{new_id}."
         st.rerun()
 
@@ -1360,11 +1927,12 @@ if save_clicked:
 # Results
 # -----------------------------------------------------------------------------
 def _verdict_banner(text, color, subtitle):
-    """Big, centered, color-coded BUY/PASS banner."""
+    """Full-width, rounded BUY/PASS banner in the design's semantic green/red with
+    legible cream text (per DESIGN.md — never a bright/alarming red)."""
     st.markdown(
-        f"<div style='padding:0.85rem 1rem;border-radius:0.5rem;background:{color};"
-        f"color:white;text-align:center;font-size:1.7rem;font-weight:700;"
-        f"letter-spacing:0.06em'>{text}</div>",
+        f"<div style='padding:0.95rem 1.25rem;border-radius:12px;background:{color};"
+        f"color:#FBFAF7;text-align:center;font-size:1.6rem;font-weight:700;"
+        f"letter-spacing:0.14em'>{text}</div>",
         unsafe_allow_html=True,
     )
     st.caption(subtitle)
@@ -1397,14 +1965,22 @@ def render_results(deal):
     except (ZeroDivisionError, ValueError):
         pro_forma, exit_result, multi_year_ok = None, None, False
 
+    # Value-add summary (Phase C) — computed once, reused by the deal memo and the
+    # value-add section below. Guarded like the projection above.
+    try:
+        value_add = engine.value_add_summary(deal)
+    except (ZeroDivisionError, ValueError):
+        value_add = None
+
     st.divider()
     st.subheader(f"Results — {deal['name']}")
 
-    # Overall verdict: the ONLY place the words BUY / PASS appear.
+    # Overall verdict: the ONLY place the words BUY / PASS appear. Design semantic
+    # colors — deep green for BUY, muted red for PASS (never a bright/alarming red).
     if verdict == "BUY":
-        _verdict_banner("BUY", "#1b5e20", "Clears every threshold below.")
+        _verdict_banner("BUY", "#2E7D4F", "Clears every threshold below.")
     else:
-        _verdict_banner("PASS", "#b71c1c", "Below one or more thresholds — see the checks below.")
+        _verdict_banner("PASS", "#B23A3A", "Below one or more thresholds — see the checks below.")
 
     # Year-one headline metrics as labeled numbers.
     metric_cols = st.columns(4)
@@ -1438,7 +2014,7 @@ def render_results(deal):
     for check in evaluation["checks"]:
         value = _format_metric(check["value"], check["display"])
         minimum = _format_metric(check["minimum"], check["display"])
-        result = "✅ MEETS" if check["passed"] else "❌ BELOW"
+        result = "MEETS" if check["passed"] else "BELOW"
         check_rows.append([check["label"], value, f"min {minimum}", result])
     st.markdown(_markdown_table(["Check", "Value", "Threshold", "Result"], check_rows))
 
@@ -1493,6 +2069,14 @@ def render_results(deal):
     else:
         st.caption(f"Expense ratio {ratio_text} — typical small multifamily runs ~35-50%.")
 
+    # ----- Deal memo (Phase E) — built from the engine's numbers, AI writes the prose -----
+    # Placed before the multi-year early-return so the memo is available even when the
+    # hold projection can't be computed (the memo handles a missing exit gracefully).
+    memo_data = deal_memo.build_memo_data(
+        deal, results, exit_result if multi_year_ok else None, value_add
+    )
+    _render_deal_memo(memo_data)
+
     # ----- Multi-year detail (Phase 7 pro forma + Phase 8 exit), below year-one -----
     if not multi_year_ok:
         return
@@ -1540,8 +2124,8 @@ def render_results(deal):
                "operating cash flow.")
 
     # ----- Value-add (Phase C): rent ramp + value creation, only if there's upside -----
-    value_add = engine.value_add_summary(deal)
-    if value_add["has_value_add"]:
+    # (value_add was already computed above and reused by the deal memo.)
+    if value_add and value_add["has_value_add"]:
         st.divider()
         st.markdown("### Value-add — forcing NOI up forces value up")
         va_cols = st.columns(4)

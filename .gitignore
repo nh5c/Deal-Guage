@@ -38,3 +38,4 @@ htmlcov/
 
 # Claude Code local settings (machine-local; shared settings.json stays tracked)
 .claude/settings.local.json
+.streamlit/secrets.toml

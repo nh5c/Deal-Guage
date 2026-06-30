@@ -1,0 +1,16 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dealgauge",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": [
+        "-m", "streamlit", "run", "cre_underwriter/dashboard.py",
+        "--server.headless", "true",
+        "--server.port", "8765",
+        "--server.runOnSave", "false"
+      ],
+      "port": 8765
+    }
+  ]
+}

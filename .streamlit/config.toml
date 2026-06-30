@@ -1,0 +1,11 @@
+# DealGauge theme — see DESIGN.md for the source-of-truth palette.
+# This themes the native Streamlit components (inputs, dataframes, sidebar, primary
+# button, focus states). The dashboard layers additional CSS on top for the logo,
+# cards, metric tiles, tables, and verdict banner.
+[theme]
+base = "light"
+primaryColor = "#12182B"            # Ink Navy — primary button + widget accents (brass stays precious, added via CSS)
+backgroundColor = "#FBFAF7"         # Paper White — main background
+secondaryBackgroundColor = "#F1ECDE"  # warm cream tint — sidebar, dataframe header, faint panels
+textColor = "#1A2238"               # Ink Text
+font = "sans serif"
