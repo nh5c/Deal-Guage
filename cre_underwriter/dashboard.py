@@ -14,6 +14,7 @@ Run it with:  streamlit run cre_underwriter/dashboard.py
 
 import base64
 import re
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +57,35 @@ def _favicon():
     encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
     return f"data:image/svg+xml;base64,{encoded}"
 
+
+# -----------------------------------------------------------------------------
+# Secrets location shim (for Render deployment).
+#
+# Streamlit's native auth (st.login) reads secrets ONLY from .streamlit/secrets.toml
+# (relative to the working directory). Render mounts secret files at the app root and
+# at /etc/secrets/<name>, never at nested paths — so a secret file named "secrets.toml"
+# lands at ./secrets.toml or /etc/secrets/secrets.toml. This moves it into the location
+# Streamlit requires. Local development is untouched, and no secret is ever hardcoded —
+# this only relocates a file the platform provides.
+# -----------------------------------------------------------------------------
+def _ensure_streamlit_secrets():
+    """Copy a Render-provided secret file into .streamlit/secrets.toml if it isn't
+    already there. No-op locally (never overwrites an existing .streamlit/secrets.toml).
+    Plain file I/O, so it's safe to run before the first Streamlit command."""
+    target = Path(".streamlit") / "secrets.toml"
+    if target.exists():
+        return   # local dev (or already copied this run) — never overwrite
+    for source in (Path("secrets.toml"), Path("/etc/secrets/secrets.toml")):
+        if source.is_file():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            except OSError:
+                pass   # best-effort; st.login surfaces a clear error if it's truly missing
+            return
+
+
+_ensure_streamlit_secrets()
 
 # st.set_page_config must be the first Streamlit call.
 st.set_page_config(page_title="DealGauge", page_icon=_favicon(), layout="centered")
