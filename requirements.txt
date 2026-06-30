@@ -24,3 +24,5 @@ psycopg2-binary>=2.9     # Phase G: PostgreSQL backend (used only when DATABASE_
 # [auth] section). That file holds secrets and is gitignored — never commit it.
 #
 # Project rule: ask before adding any new dependency.
+httpx
+streamlit[auth]
