@@ -383,10 +383,14 @@ footer {{ display: none; }}
 
 def _login_cta(key):
     """A centered brass 'Sign in with Google' button that starts the Google OIDC flow.
-    Centered with a 3-column row (reliable) and width-capped via CSS."""
+
+    Uses on_click=st.login (Streamlit's recommended pattern): st.login runs in the click
+    callback and redirects to Google via the [auth] config in secrets.toml. After the
+    OAuth callback returns, the auth gate detects the signed-in identity and shows the
+    app. Centered with a 3-column row (reliable) and width-capped via CSS."""
     middle = st.columns([1, 1, 1])[1]
-    if middle.button("Sign in with Google", key=key, type="primary", use_container_width=True):
-        st.login()   # uses the [auth] config in secrets.toml; redirects to Google
+    middle.button("Sign in with Google", key=key, type="primary",
+                  use_container_width=True, on_click=st.login)
 
 
 def _render_landing():
@@ -1434,10 +1438,26 @@ def _apply_extraction_to_form(result):
         st.session_state["expense_mode_label"] = "Simple (single total)"
 
 
-# Authentication gate: a signed-out visitor sees only the marketing landing page (which
-# calls st.stop()), so none of the app below renders until they're signed in with Google.
-if not st.user.is_logged_in:
-    _render_landing()
+# -----------------------------------------------------------------------------
+# Authentication gate.
+#
+# A signed-out visitor sees only the marketing landing page. After they sign in with
+# Google, the OAuth callback returns and Streamlit reruns with st.user.is_logged_in
+# == True — but that first post-callback run can still be mid-flight, so we force one
+# clean st.rerun() the moment the identity appears. That guarantees the gate
+# re-evaluates and the app (not the landing page) renders. Logging out flips the state
+# back and returns to the landing page.
+# -----------------------------------------------------------------------------
+if st.user.is_logged_in:
+    if not st.session_state.get("_authenticated"):
+        # Identity just became available (e.g. straight after the OAuth callback):
+        # rerun once so every part of the app initializes from a clean, signed-in run.
+        st.session_state["_authenticated"] = True
+        st.rerun()
+else:
+    st.session_state.pop("_authenticated", None)   # reset so logout lands cleanly on the gate
+    _render_landing()   # marketing landing + Google CTAs; ends with st.stop()
+    st.stop()           # defensive: never fall through to the app while signed out
 
 # From here on the visitor is signed in. Their email owns the deals they save/load.
 USER_EMAIL = current_user_email()
