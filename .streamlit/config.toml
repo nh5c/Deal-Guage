@@ -1,3 +1,37 @@
+# DealGauge config. Committed (no secrets). Render reads .streamlit/config.toml from
+# the repo root, and so does local `streamlit run` — so anything here applies to BOTH
+# environments. Environment-specific values (the public domain) must NOT live here;
+# see the note under [server].
+
+[server]
+# Native auth (st.login) REQUIRES CORS + XSRF protection and turns them on regardless
+# of config, so keep them enabled. Disabling them does NOT fix the proxy origin error
+# (it's overridden) and only weakens security. These are the defaults, set explicitly
+# so they are never accidentally turned off.
+enableCORS = true
+enableXsrfProtection = true
+
+# --- The reverse-proxy origin fix (Render) — NOT set here on purpose -----------------
+# The "Origin mismatch / misconfigured origin for redirect_uri" error means Streamlit's
+# own serving origin (browser.serverAddress, which DEFAULTS to "localhost") does not
+# match the [auth] redirect_uri's origin (https://www.dealgaugecre.com). The fix is to
+# tell Streamlit its real public address with browser.serverAddress. There is NO Streamlit
+# setting that "trusts X-Forwarded-* headers"; browser.serverAddress is the lever.
+#
+# It is environment-specific, so it canNOT be committed here: locally the redirect_uri is
+# http://localhost:8501/oauth2callback, so browser.serverAddress must stay "localhost"
+# for local dev to work. Set it ONLY on Render, via the start command or an env var:
+#
+#   start command:  streamlit run cre_underwriter/dashboard.py \
+#                     --server.address 0.0.0.0 --server.port $PORT \
+#                     --browser.serverAddress www.dealgaugecre.com --server.headless true
+#
+#   or env var:     STREAMLIT_BROWSER_SERVER_ADDRESS = www.dealgaugecre.com
+#
+# That makes Streamlit treat its origin as https://www.dealgaugecre.com (Render's proxy
+# forwards X-Forwarded-Proto: https), which matches the redirect_uri — so the websocket
+# origin check passes and the auth cookie is set.
+
 # DealGauge theme — see DESIGN.md for the source-of-truth palette.
 # This themes the native Streamlit components (inputs, dataframes, sidebar, primary
 # button, focus states). The dashboard layers additional CSS on top for the logo,

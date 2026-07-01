@@ -24,13 +24,15 @@ import streamlit as st
 # `streamlit run cre_underwriter/dashboard.py` (script folder on the path) and as
 # part of the package.
 try:
-    from cre_underwriter import engine, database, rentcast, extraction, deal_memo
+    from cre_underwriter import (engine, database, rentcast, extraction, deal_memo,
+                                 social_meta)
 except ModuleNotFoundError:
     import engine
     import database
     import rentcast
     import extraction
     import deal_memo
+    import social_meta
 
 
 # -----------------------------------------------------------------------------
@@ -86,6 +88,13 @@ def _ensure_streamlit_secrets():
 
 
 _ensure_streamlit_secrets()
+
+# Inject DealGauge's Open Graph / social-preview tags into Streamlit's static index.html
+# so pasted links (iMessage, Slack, LinkedIn) unfurl with DealGauge branding instead of
+# the Streamlit default. Unfurlers read the raw HTML <head> and never run JS, so this
+# must patch the served file — set_page_config below only affects the live tab. Idempotent
+# and best-effort (never raises); see social_meta.py for the full rationale.
+social_meta.patch_streamlit_index_html()
 
 # st.set_page_config must be the first Streamlit call.
 st.set_page_config(page_title="DealGauge", page_icon=_favicon(), layout="centered")
